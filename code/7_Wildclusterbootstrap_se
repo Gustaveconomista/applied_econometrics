@@ -1,0 +1,129 @@
+import numpy as np
+import pandas as pd
+import statsmodels.api as sm
+from numpy.random import default_rng
+from scipy.stats import t as tdist
+
+# -----------------------------
+# Parâmetros
+# -----------------------------
+G = 5       # número de clusters
+NG = 30     # observações por cluster
+R = 1000    # replicações Monte Carlo
+B = 399     # reamostragens bootstrap (wild cluster bootstrap-SE)
+beta_0 = 0
+beta_1 = 1
+alpha = 0.05
+
+rng = default_rng(42)
+
+# -----------------------------
+# DGP
+# -----------------------------
+def generate_data(G, NG, beta_0=0, beta_1=1):
+    zg = rng.normal(size=G)        # componente comum em x
+    eps_g = rng.normal(size=G)     # componente comum no erro
+
+    data_list = []
+    for g in range(G):
+        zig   = rng.normal(size=NG)    # idiossincrático x
+        eps_i = rng.normal(size=NG)    # idiossincrático erro
+
+        xig = zg[g] + zig
+        uig = eps_g[g] + eps_i
+        yig = beta_0 + beta_1 * xig + uig
+
+        data_list.append(pd.DataFrame({
+            "y": yig, "x": xig, "cluster": g + 1
+        }))
+    return pd.concat(data_list, ignore_index=True)
+
+# -----------------------------
+# OLS (para obter beta_hat e resíduos)
+# -----------------------------
+def fit_ols_return_resid(df):
+    X = sm.add_constant(df["x"].to_numpy())
+    y = df["y"].to_numpy()
+    ols = sm.OLS(y, X).fit()
+    beta_hat = ols.params.copy()
+    y_hat = X @ beta_hat
+    resid = y - y_hat
+    return beta_hat, resid, X
+
+# -----------------------------
+# Wild Cluster Bootstrap-SE
+# - NÃO impõe H0; usa resíduos do modelo irrestrito
+# - y* = X * beta_hat + v_g * e_hat, v_g ~ Rademacher por cluster
+# - Reestima OLS em cada y* e coleta beta1*
+# - se_boot = sd(beta1*)
+# - Estatística do teste: t_SE = (beta1_hat - beta_true) / se_boot
+#   (Comparada a t_{G-1} bicaudal)
+# -----------------------------
+def wild_cluster_bootstrap_se(df, B=399):
+    # Ajuste irrestrito e resíduos
+    beta_hat, resid, X = fit_ols_return_resid(df)
+    b1_hat = float(beta_hat[1])
+
+    clusters = df["cluster"].to_numpy()
+    uniq = np.unique(clusters)
+
+    b1_star = np.empty(B)
+    for b in range(B):
+        # Pesos Rademacher por cluster
+        w = {g: rng.choice([-1.0, 1.0]) for g in uniq}
+        w_vec = np.array([w[g] for g in clusters])
+
+        # Gera y* e reestima OLS
+        y_star = (X @ beta_hat) + w_vec * resid
+        ols_star = sm.OLS(y_star, X).fit()
+        b1_star[b] = ols_star.params[1]
+
+    # Erro-padrão bootstrap do estimador
+    se_boot = float(np.std(b1_star, ddof=1))
+
+    # fallback de estabilidade (raro, mas útil)
+    if not np.isfinite(se_boot) or se_boot == 0.0:
+        se_boot = np.nan
+
+    return b1_hat, se_boot
+
+# -----------------------------
+# Monte Carlo usando o bootstrap-SE
+# Rejeita H0 se |t_SE| > t_{1-alpha/2, G-1}
+# -----------------------------
+def run_monte_carlo_wild_cluster_se(R, G, NG, beta_true=1.0, B=399, alpha=0.05):
+    rejects = []
+    se_samples = []
+
+    # ponto de corte t com G-1 g.l.
+    tcrit = tdist.ppf(1 - alpha/2, df=G - 1)
+
+    for r in range(R):
+        df = generate_data(G, NG, beta_0=0, beta_1=beta_true)
+
+        b1_hat, se_boot = wild_cluster_bootstrap_se(df, B=B)
+
+        # Se o se_boot vier NaN (degenerado), não rejeita por segurança
+        if not np.isfinite(se_boot) or se_boot == 0.0:
+            rejects.append(False)
+            continue
+
+        t_se = (b1_hat - beta_true) / se_boot
+        rejects.append(abs(t_se) > tcrit)
+        se_samples.append(se_boot)
+
+    rejection_rate = float(np.mean(rejects))
+    sd_rejection = float(np.sqrt(rejection_rate * (1 - rejection_rate) / R))
+    avg_se_boot = float(np.mean(se_samples)) if len(se_samples) > 0 else np.nan
+    return rejection_rate, sd_rejection, avg_se_boot
+
+# -----------------------------
+# Executar
+# -----------------------------
+rejection_rate, sd_rej, avg_se = run_monte_carlo_wild_cluster_se(
+    R=R, G=G, NG=NG, beta_true=beta_1, B=B, alpha=alpha
+)
+
+print(f"Rejection rate (wild cluster bootstrap-SE, B={B}): {rejection_rate:.4f}")
+print(f"Desvio-padrão da rejection rate: {sd_rej:.4f}")
+print(f"Média do SE bootstrap (beta1): {avg_se:.4f}")

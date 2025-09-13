@@ -1,0 +1,123 @@
+import numpy as np
+import pandas as pd
+import statsmodels.api as sm
+from numpy.random import default_rng
+
+# -----------------------------
+# Parâmetros
+# -----------------------------
+G = 5       # número de clusters
+NG = 30     # observações por cluster
+R = 1000    # replicações Monte Carlo
+B = 399     # bootstraps (wild cluster bootstrap-t)
+beta_0 = 0
+beta_1 = 1
+alpha = 0.05
+
+rng = default_rng(42)
+
+# -----------------------------
+# DGP
+# -----------------------------
+def generate_data(G, NG, beta_0=0, beta_1=1):
+    zg = rng.normal(size=G)        # componente comum em x
+    eps_g = rng.normal(size=G)     # componente comum no erro
+
+    data_list = []
+    for g in range(G):
+        zig   = rng.normal(size=NG)    # idiossincrático x
+        eps_i = rng.normal(size=NG)    # idiossincrático erro
+
+        xig = zg[g] + zig
+        uig = eps_g[g] + eps_i
+        yig = beta_0 + beta_1 * xig + uig
+
+        data_list.append(pd.DataFrame({
+            "y": yig, "x": xig, "cluster": g + 1
+        }))
+    return pd.concat(data_list, ignore_index=True)
+
+# -----------------------------
+# OLS + SE cluster-robusto (helper)
+# -----------------------------
+def fit_ols_cluster(df):
+    X = sm.add_constant(df["x"].to_numpy())
+    y = df["y"].to_numpy()
+    ols = sm.OLS(y, X).fit()
+
+    groups = df["cluster"].to_numpy()
+    rob = ols.get_robustcov_results(
+        cov_type="cluster",
+        groups=groups,
+        use_correction=True,
+        df_correction=True
+    )
+    beta1_hat = rob.params[1]
+    se_beta1  = rob.bse[1]
+    return beta1_hat, se_beta1
+
+# -----------------------------
+# Wild Cluster Bootstrap-t (CGM/BDM)
+# - Impõe H0: beta1 = beta_true via regressão restrita:
+#   y = beta_true * x + c + e   (equivalente a regredir y - beta_true*x em constante)
+# - Gera y* = y_hat0 + v_g * e0, com v_g ~ Rademacher por cluster
+# - Reestima modelo em y* e computa t* = (b1* - beta_true)/se_cluster(b1*)
+# - p-valor = frac{|t*| >= |t_obs|}
+# -----------------------------
+def wild_cluster_bootstrap_t(df, beta_true, B=399):
+    # 1) Ajuste irrestrito para t observado
+    b1_hat, se1 = fit_ols_cluster(df)
+    t_obs = (b1_hat - beta_true) / se1
+
+    # 2) Ajuste restrito para obter resíduos sob H0
+    #    Regride y_restr = y - beta_true*x em constante
+    y_restr = df["y"].to_numpy() - beta_true * df["x"].to_numpy()
+    Xc = np.ones((len(df), 1))
+    ols_c = sm.OLS(y_restr, Xc).fit()
+    c_hat = ols_c.params[0]
+    y_hat0 = beta_true * df["x"].to_numpy() + c_hat
+    e0 = df["y"].to_numpy() - y_hat0
+
+    clusters = df["cluster"].to_numpy()
+    uniq = np.unique(clusters)
+
+    t_boot = np.empty(B)
+    for b in range(B):
+        # 3) Pesos Rademacher por cluster
+        w = {g: rng.choice([-1.0, 1.0]) for g in uniq}
+        # 4) Gera amostra bootstrap y* = y_hat0 + w_g * e0
+        y_star = y_hat0 + np.array([w[g] for g in clusters]) * e0
+        df_star = df.copy()
+        df_star["y"] = y_star
+
+        # 5) Reestima e computa t*
+        b1_star, se1_star = fit_ols_cluster(df_star)
+        t_boot[b] = (b1_star - beta_true) / se1_star
+
+    # 6) p-valor bootstrap (bicaudal)
+    p_boot = np.mean(np.abs(t_boot) >= np.abs(t_obs))
+    return p_boot, t_obs
+
+# -----------------------------
+# Monte Carlo envolvendo o bootstrap
+# -----------------------------
+def run_monte_carlo_wild_cluster(R, G, NG, beta_true=1.0, B=399, alpha=0.05):
+    rejects = []
+    for r in range(R):
+        df = generate_data(G, NG, beta_0=0, beta_1=beta_true)
+        pval_boot, _ = wild_cluster_bootstrap_t(df, beta_true=beta_true, B=B)
+        rejects.append(pval_boot < alpha)
+
+    rejection_rate = float(np.mean(rejects))
+    sd_rejection = float(np.sqrt(rejection_rate * (1 - rejection_rate) / R))
+    return rejection_rate, sd_rejection
+
+# -----------------------------
+# Executar
+# -----------------------------
+rejection_rate, sd_rej = run_monte_carlo_wild_cluster(
+    R=R, G=G, NG=NG, beta_true=beta_1, B=B, alpha=alpha
+)
+
+print(f"Rejection rate (wild cluster bootstrap-t, B={B}): {rejection_rate:.4f}")
+print(f"Desvio-padrão da rejection rate: {sd_rej:.4f}")
