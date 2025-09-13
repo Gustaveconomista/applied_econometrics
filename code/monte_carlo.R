@@ -8,7 +8,8 @@ pacman::p_load(
   tidyverse,
   sandwich,
   lmtest,
-  boot
+  boot,
+  here
 )
 
 #### Pre setting ####
@@ -352,11 +353,34 @@ cat("\nResultados esperados do paper (G = 5):\n")
 expected = c(0.426, 0.130, 0.195, 0.088, 0.152, 0.047, 0.012, 
               0.161, 0.117, 0.081, 0.081, 0.034, 0.054)
 
-cat("Método                     | Obtido | Esperado | Diferença\n")
-cat("---------------------------|--------|----------|----------\n")
-for (i in 1:min(13, nrow(results))) {
-  diff = results$rejection_rate[i] - expected[i]
-  cat(sprintf("%-25s | %.3f  | %.3f    | %+.3f\n", 
-              substr(results$method[i], 1, 25), 
-              results$rejection_rate[i], expected[i], diff))
-}
+# cat("Método                     | Obtido | Esperado | Diferença (%)\n")
+# cat("---------------------------|--------|----------|----------\n")
+# for (i in 1:min(13, nrow(results))) {
+#   perct_diff = ((results$rejection_rate[i] - expected[i])/expected[i])*100
+#   cat(sprintf("%-25s | %.3f  | %.3f    | %+.3f\n", 
+#               substr(results$method[i], 1, 25), 
+#               results$rejection_rate[i], expected[i], perct_diff))
+# }
+
+# Definindo o número de linhas da tabela, máximo 13 ou quantas houver
+n = min(13, nrow(results))
+
+# Calculando a diferença percentual
+perct_diff = ((results$rejection_rate[1:n] - expected[1:n]) / expected[1:n]) * 100
+
+# Criando o data frame/tabela
+tabela_resultado = data.frame(
+  Método = substr(results$method[1:n], 1, 25),
+  Obtido = round(results$rejection_rate[1:n], 3),
+  Esperado = round(expected[1:n], 3),
+  Diferença  = round(perct_diff, 3),
+  stringsAsFactors = FALSE
+)
+
+names(tabela_resultado)[4] = "Diferença (%)"
+
+# Exibindo a tabela
+tabela_resultado
+
+##### Exporting the results table #####
+write.csv(tabela_resultado, here("out", "tabela_resultado.csv"), row.names = F, fileEncoding = 'latin1')
