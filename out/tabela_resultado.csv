@@ -1,4 +1,4 @@
-"MÃ©todo","Obtido","Esperado","DiferenÃ§a (%)"
+"Método","Obtido","Esperado","Diferença (%)"
 "Default (i.i.d.)",0.477,0.426,11.972
 "Moulton-type",0.003,0.13,-97.692
 "Cluster-robust",0.208,0.195,6.667
