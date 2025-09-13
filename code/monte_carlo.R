@@ -1,6 +1,9 @@
-# Replicação das Simulações Monte Carlo - Cameron, Gelbach, Miller (2008)
-# Tabela 2: DGP com Erros Agrupados Homocedásticos, G=5
+###################### Replication - Applied Econometrics ######################
+################################# FGV EPGE #####################################
+######################### Author: Gustavo Henrique #############################
+############################ Monte Carlo Simulations ###########################
 
+#### Loading/Installing needed packages ####
 pacman::p_load(
   tidyverse,
   sandwich,
@@ -8,98 +11,99 @@ pacman::p_load(
   boot
 )
 
+#### Pre setting ####
 set.seed(42)
 
 # Parâmetros da simulação
-G <- 5      # número de clusters
-NG <- 30    # observações por cluster
-R <- 1000   # replicações Monte Carlo
-B <- 399    # replicações bootstrap
-beta_0 <- 0
-beta_1 <- 1
-alpha <- 0.05
+G = 5      # número de clusters
+NG = 30    # observações por cluster
+R = 1000   # replicações Monte Carlo
+B = 399    # replicações bootstrap
+beta_0 = 0
+beta_1 = 1
+alpha = 0.05
 
 # Função para gerar dados conforme DGP do paper (equação 7)
-generate_data <- function(G, NG) {
+generate_data = function(G, NG) {
   # Componentes comuns por cluster
-  zg <- rnorm(G)
-  epsilon_g <- rnorm(G)
+  zg = rnorm(G)
+  epsilon_g = rnorm(G)
   
-  data <- data.frame()
+  data = data.frame()
   
   for (g in 1:G) {
     # Componentes específicos por observação
-    zig <- rnorm(NG)
-    epsilon_ig <- rnorm(NG)
+    zig = rnorm(NG)
+    epsilon_ig = rnorm(NG)
     
     # Construir variáveis
-    xig <- zg[g] + zig
-    uig <- epsilon_g[g] + epsilon_ig
-    yig <- beta_0 + beta_1 * xig + uig
+    xig = zg[g] + zig
+    uig = epsilon_g[g] + epsilon_ig
+    yig = beta_0 + beta_1 * xig + uig
     
-    cluster_data <- data.frame(
+    cluster_data = data.frame(
       y = yig,
       x = xig,
       cluster = rep(g, NG)
     )
     
-    data <- rbind(data, cluster_data)
+    data = rbind(data, cluster_data)
   }
   
   return(data)
 }
 
 # Função para variância cluster-robusta padrão
-cluster_vcov <- function(model, cluster_var) {
+cluster_vcov = function(model, cluster_var) {
   vcovCL(model, cluster = cluster_var)
 }
 
 # Função para correção CR3 (jackknife)
-cr3_vcov <- function(model, cluster_var) {
-  clusters <- unique(cluster_var)
-  G <- length(clusters)
-  X <- model.matrix(model)
+cr3_vcov = function(model, cluster_var) {
+  clusters = unique(cluster_var)
+  G = length(clusters)
+  X = model.matrix(model)
   
   # Estimativas leave-one-cluster-out
-  beta_jack <- matrix(0, G, ncol(X))
+  beta_jack = matrix(0, G, ncol(X))
   
   for (i in 1:G) {
-    idx <- cluster_var != clusters[i]
-    data_jack <- data.frame(y = model$model$y[idx], 
+    idx = cluster_var != clusters[i]
+    data_jack = data.frame(y = model$model$y[idx], 
                             x = model$model$x[idx])
-    model_jack <- lm(y ~ x, data = data_jack)
-    beta_jack[i, ] <- coef(model_jack)
+    model_jack = lm(y ~ x, data = data_jack)
+    beta_jack[i, ] = coef(model_jack)
   }
   
-  beta_hat <- coef(model)
-  V_jack <- ((G-1)/G) * t(beta_jack - matrix(rep(beta_hat, G), nrow = G, byrow = TRUE)) %*% 
+  beta_hat = coef(model)
+  V_jack = ((G-1)/G) * t(beta_jack - matrix(rep(beta_hat, G), nrow = G, byrow = TRUE)) %*% 
     (beta_jack - matrix(rep(beta_hat, G), nrow = G, byrow = TRUE))
   
   return(V_jack)
 }
 
 # Função para bootstrap pairs cluster
-pairs_cluster_bootstrap <- function(data, B = 399) {
-  clusters <- unique(data$cluster)
-  G <- length(clusters)
-  beta_boot <- numeric(B)
+pairs_cluster_bootstrap = function(data, B = 399) {
+  clusters = unique(data$cluster)
+  G = length(clusters)
+  beta_boot = numeric(B)
   
   for (b in 1:B) {
     # Reamostrar clusters com reposição
-    boot_clusters <- sample(clusters, G, replace = TRUE)
-    boot_data <- data.frame()
+    boot_clusters = sample(clusters, G, replace = TRUE)
+    boot_data = data.frame()
     
     for (g in boot_clusters) {
-      cluster_data <- data[data$cluster == g, ]
-      boot_data <- rbind(boot_data, cluster_data)
+      cluster_data = data[data$cluster == g, ]
+      boot_data = rbind(boot_data, cluster_data)
     }
     
     # Estimar modelo na amostra bootstrap
     tryCatch({
-      boot_model <- lm(y ~ x, data = boot_data)
-      beta_boot[b] <- coef(boot_model)[2]
+      boot_model = lm(y ~ x, data = boot_data)
+      beta_boot[b] = coef(boot_model)[2]
     }, error = function(e) {
-      beta_boot[b] <- NA
+      beta_boot[b] = NA
     })
   }
   
@@ -107,36 +111,36 @@ pairs_cluster_bootstrap <- function(data, B = 399) {
 }
 
 # Função para bootstrap-t pairs cluster
-pairs_cluster_bootstrap_t <- function(data, B = 399) {
-  original_model <- lm(y ~ x, data = data)
-  beta_hat <- coef(original_model)[2]
+pairs_cluster_bootstrap_t = function(data, B = 399) {
+  original_model = lm(y ~ x, data = data)
+  beta_hat = coef(original_model)[2]
   
-  clusters <- unique(data$cluster)
-  G <- length(clusters)
-  t_boot <- numeric(B)
+  clusters = unique(data$cluster)
+  G = length(clusters)
+  t_boot = numeric(B)
   
   for (b in 1:B) {
     # Reamostrar clusters com reposição
-    boot_clusters <- sample(clusters, G, replace = TRUE)
-    boot_data <- data.frame()
+    boot_clusters = sample(clusters, G, replace = TRUE)
+    boot_data = data.frame()
     
     for (g in boot_clusters) {
-      cluster_data <- data[data$cluster == g, ]
-      boot_data <- rbind(boot_data, cluster_data)
+      cluster_data = data[data$cluster == g, ]
+      boot_data = rbind(boot_data, cluster_data)
     }
     
     # Estimar modelo e erro padrão na amostra bootstrap
     tryCatch({
-      boot_model <- lm(y ~ x, data = boot_data)
-      beta_star <- coef(boot_model)[2]
+      boot_model = lm(y ~ x, data = boot_data)
+      beta_star = coef(boot_model)[2]
       
       # Erro padrão cluster-robusto
-      se_star <- sqrt(cluster_vcov(boot_model, boot_data$cluster)[2,2])
+      se_star = sqrt(cluster_vcov(boot_model, boot_data$cluster)[2,2])
       
       # Estatística t bootstrap
-      t_boot[b] <- (beta_star - beta_hat) / se_star
+      t_boot[b] = (beta_star - beta_hat) / se_star
     }, error = function(e) {
-      t_boot[b] <- NA
+      t_boot[b] = NA
     })
   }
   
@@ -144,69 +148,70 @@ pairs_cluster_bootstrap_t <- function(data, B = 399) {
 }
 
 # Função para wild cluster bootstrap-t com H0 imposta
-wild_cluster_bootstrap_t <- function(data, beta_0_test = 1, B = 399) {
+wild_cluster_bootstrap_t = function(data, beta_0_test = 1, B = 399) {
   # Modelo restrito sob H0
-  restricted_data <- data
-  restricted_data$y_restricted <- data$y - beta_0_test * data$x
+  restricted_data = data
+  restricted_data$y_restricted = data$y - beta_0_test * data$x
   
   # Resíduos restritos por cluster
-  clusters <- unique(data$cluster)
-  G <- length(clusters)
+  clusters = unique(data$cluster)
+  G = length(clusters)
   
   # Obter resíduos restritos
-  restricted_model <- lm(y_restricted ~ 1, data = restricted_data)
-  residuals_by_cluster <- list()
+  restricted_model = lm(y_restricted ~ 1, data = restricted_data)
+  residuals_by_cluster = list()
   
   for (g in clusters) {
-    idx <- data$cluster == g
-    residuals_by_cluster[[g]] <- restricted_model$residuals[idx]
+    idx = data$cluster == g
+    residuals_by_cluster[[g]] = restricted_model$residuals[idx]
   }
   
-  t_boot <- numeric(B)
+  t_boot = numeric(B)
   
   for (b in 1:B) {
     # Aplicar pesos Rademacher por cluster
-    wild_data <- data
+    wild_data = data
     
     for (g in clusters) {
-      idx <- data$cluster == g
-      weight <- sample(c(-1, 1), 1)
-      wild_residuals <- weight * residuals_by_cluster[[g]]
-      wild_data$y[idx] <- beta_0_test * data$x[idx] + wild_residuals
+      idx = data$cluster == g
+      weight = sample(c(-1, 1), 1)
+      wild_residuals = weight * residuals_by_cluster[[g]]
+      wild_data$y[idx] = beta_0_test * data$x[idx] + wild_residuals
     }
     
     # Estimar modelo não-restrito na amostra wild bootstrap
     tryCatch({
-      wild_model <- lm(y ~ x, data = wild_data)
-      beta_star <- coef(wild_model)[2]
+      wild_model = lm(y ~ x, data = wild_data)
+      beta_star = coef(wild_model)[2]
       
       # Erro padrão cluster-robusto
-      se_star <- sqrt(cluster_vcov(wild_model, wild_data$cluster)[2,2])
+      se_star = sqrt(cluster_vcov(wild_model, wild_data$cluster)[2,2])
       
       # Estatística t bootstrap (centrada em beta_0_test)
-      t_boot[b] <- (beta_star - beta_0_test) / se_star
+      t_boot[b] = (beta_star - beta_0_test) / se_star
     }, error = function(e) {
-      t_boot[b] <- NA
+      t_boot[b] = NA
     })
   }
   
   return(t_boot[!is.na(t_boot)])
 }
 
+#### Monte Carlo Simulations ####
 # Executar simulações Monte Carlo
-results <- data.frame(
+results = data.frame(
   method = character(13),
   rejection_rate = numeric(13),
   std_error = numeric(13),
   stringsAsFactors = FALSE
 )
 
-methods <- c("Default (i.i.d.)", "Moulton-type", "Cluster-robust", "CR3 correction",
+methods = c("Default (i.i.d.)", "Moulton-type", "Cluster-robust", "CR3 correction",
              "Pairs bootstrap-se", "Residual bootstrap-se", "Wild bootstrap-se", 
              "Pairs BCA", "BDM bootstrap-t", "Pairs bootstrap-t", 
              "Pairs CR3 bootstrap-t", "Residual bootstrap-t", "Wild bootstrap-t")
 
-rejections <- matrix(0, R, 13)
+rejections = matrix(0, R, 13)
 
 cat("Executando", R, "simulações Monte Carlo com G =", G, "clusters...\n")
 
@@ -214,123 +219,123 @@ for (r in 1:R) {
   if (r %% 100 == 0) cat("Simulação", r, "de", R, "\n")
   
   # Gerar dados
-  data <- generate_data(G, NG)
+  data = generate_data(G, NG)
   
   # Estimar modelo original
-  model <- lm(y ~ x, data = data)
-  beta_hat <- coef(model)[2]
+  model = lm(y ~ x, data = data)
+  beta_hat = coef(model)[2]
   
   # 1. Default (i.i.d. errors)
-  se_default <- sqrt(vcov(model)[2,2])
-  t_stat_default <- (beta_hat - beta_1) / se_default
-  rejections[r, 1] <- abs(t_stat_default) > qnorm(0.975)
+  se_default = sqrt(vcov(model)[2,2])
+  t_stat_default = (beta_hat - beta_1) / se_default
+  rejections[r, 1] = abs(t_stat_default) > qnorm(0.975)
   
   # 2. Moulton-type (aproximação usando random effects)
   # Para simplificar, usamos uma correção ad-hoc
-  icc <- 0.5  # correlação intraclasse aproximada
-  design_effect <- 1 + (NG - 1) * icc
-  se_moulton <- se_default * sqrt(design_effect)
-  t_stat_moulton <- (beta_hat - beta_1) / se_moulton
-  rejections[r, 2] <- abs(t_stat_moulton) > qnorm(0.975)
+  icc = 0.5  # correlação intraclasse aproximada
+  design_effect = 1 + (NG - 1) * icc
+  se_moulton = se_default * sqrt(design_effect)
+  t_stat_moulton = (beta_hat - beta_1) / se_moulton
+  rejections[r, 2] = abs(t_stat_moulton) > qnorm(0.975)
   
   # 3. Cluster-robust
   tryCatch({
-    se_cluster <- sqrt(cluster_vcov(model, data$cluster)[2,2])
-    t_stat_cluster <- (beta_hat - beta_1) / se_cluster
-    rejections[r, 3] <- abs(t_stat_cluster) > qnorm(0.975)
-  }, error = function(e) rejections[r, 3] <- 0)
+    se_cluster = sqrt(cluster_vcov(model, data$cluster)[2,2])
+    t_stat_cluster = (beta_hat - beta_1) / se_cluster
+    rejections[r, 3] = abs(t_stat_cluster) > qnorm(0.975)
+  }, error = function(e) rejections[r, 3] = 0)
   
   # 4. CR3 correction
   tryCatch({
-    V_cr3 <- cr3_vcov(model, data$cluster)
-    se_cr3 <- sqrt(V_cr3[2,2])
-    t_stat_cr3 <- (beta_hat - beta_1) / se_cr3
-    rejections[r, 4] <- abs(t_stat_cr3) > qnorm(0.975)
-  }, error = function(e) rejections[r, 4] <- 0)
+    V_cr3 = cr3_vcov(model, data$cluster)
+    se_cr3 = sqrt(V_cr3[2,2])
+    t_stat_cr3 = (beta_hat - beta_1) / se_cr3
+    rejections[r, 4] = abs(t_stat_cr3) > qnorm(0.975)
+  }, error = function(e) rejections[r, 4] = 0)
   
   # 5. Pairs cluster bootstrap-se
   tryCatch({
-    beta_boot <- pairs_cluster_bootstrap(data, B)
+    beta_boot = pairs_cluster_bootstrap(data, B)
     if (length(beta_boot) > 10) {
-      se_boot <- sd(beta_boot)
-      t_stat_boot_se <- (beta_hat - beta_1) / se_boot
-      rejections[r, 5] <- abs(t_stat_boot_se) > qnorm(0.975)
+      se_boot = sd(beta_boot)
+      t_stat_boot_se = (beta_hat - beta_1) / se_boot
+      rejections[r, 5] = abs(t_stat_boot_se) > qnorm(0.975)
     }
-  }, error = function(e) rejections[r, 5] <- 0)
+  }, error = function(e) rejections[r, 5] = 0)
   
   # Métodos 6-8: Simplificados por brevidade
-  rejections[r, 6:8] <- 0
+  rejections[r, 6:8] = 0
   
   # 9. BDM bootstrap-t (usando erros padrão default)
   tryCatch({
-    t_boot_bdm <- numeric(B)
-    clusters <- unique(data$cluster)
-    G_local <- length(clusters)
+    t_boot_bdm = numeric(B)
+    clusters = unique(data$cluster)
+    G_local = length(clusters)
     
     for (b in 1:min(B, 50)) {  # Reduzido para velocidade
-      boot_clusters <- sample(clusters, G_local, replace = TRUE)
-      boot_data <- data.frame()
+      boot_clusters = sample(clusters, G_local, replace = TRUE)
+      boot_data = data.frame()
       
       for (g in boot_clusters) {
-        cluster_data <- data[data$cluster == g, ]
-        boot_data <- rbind(boot_data, cluster_data)
+        cluster_data = data[data$cluster == g, ]
+        boot_data = rbind(boot_data, cluster_data)
       }
       
-      boot_model <- lm(y ~ x, data = boot_data)
-      beta_star <- coef(boot_model)[2]
-      se_star_default <- sqrt(vcov(boot_model)[2,2])  # Erro padrão default
-      t_boot_bdm[b] <- (beta_star - beta_hat) / se_star_default
+      boot_model = lm(y ~ x, data = boot_data)
+      beta_star = coef(boot_model)[2]
+      se_star_default = sqrt(vcov(boot_model)[2,2])  # Erro padrão default
+      t_boot_bdm[b] = (beta_star - beta_hat) / se_star_default
     }
     
-    t_boot_bdm <- t_boot_bdm[t_boot_bdm != 0]
+    t_boot_bdm = t_boot_bdm[t_boot_bdm != 0]
     if (length(t_boot_bdm) > 5) {
-      t_original <- (beta_hat - beta_1) / se_default
-      p_value <- mean(abs(t_boot_bdm) >= abs(t_original))
-      rejections[r, 9] <- p_value < alpha
+      t_original = (beta_hat - beta_1) / se_default
+      p_value = mean(abs(t_boot_bdm) >= abs(t_original))
+      rejections[r, 9] = p_value < alpha
     }
-  }, error = function(e) rejections[r, 9] <- 0)
+  }, error = function(e) rejections[r, 9] = 0)
   
   # 10. Pairs cluster bootstrap-t
   tryCatch({
-    t_boot <- pairs_cluster_bootstrap_t(data, min(B, 50))
+    t_boot = pairs_cluster_bootstrap_t(data, min(B, 50))
     if (length(t_boot) > 5) {
-      se_cluster_orig <- sqrt(cluster_vcov(model, data$cluster)[2,2])
-      t_original <- (beta_hat - beta_1) / se_cluster_orig
+      se_cluster_orig = sqrt(cluster_vcov(model, data$cluster)[2,2])
+      t_original = (beta_hat - beta_1) / se_cluster_orig
       
       # Quantis bootstrap
-      q_lower <- quantile(t_boot, alpha/2, na.rm = TRUE)
-      q_upper <- quantile(t_boot, 1 - alpha/2, na.rm = TRUE)
-      rejections[r, 10] <- (t_original < q_lower) | (t_original > q_upper)
+      q_lower = quantile(t_boot, alpha/2, na.rm = TRUE)
+      q_upper = quantile(t_boot, 1 - alpha/2, na.rm = TRUE)
+      rejections[r, 10] = (t_original < q_lower) | (t_original > q_upper)
     }
-  }, error = function(e) rejections[r, 10] <- 0)
+  }, error = function(e) rejections[r, 10] = 0)
   
   # 11. Pairs CR3 bootstrap-t (simplificado)
-  rejections[r, 11] <- rejections[r, 10]
+  rejections[r, 11] = rejections[r, 10]
   
   # 12. Residual cluster bootstrap-t (simplificado)
-  rejections[r, 12] <- 0
+  rejections[r, 12] = 0
   
   # 13. Wild cluster bootstrap-t
   tryCatch({
-    t_boot <- wild_cluster_bootstrap_t(data, beta_1, min(B, 50))
+    t_boot = wild_cluster_bootstrap_t(data, beta_1, min(B, 50))
     if (length(t_boot) > 5) {
-      se_cluster_orig <- sqrt(cluster_vcov(model, data$cluster)[2,2])
-      t_original <- (beta_hat - beta_1) / se_cluster_orig
+      se_cluster_orig = sqrt(cluster_vcov(model, data$cluster)[2,2])
+      t_original = (beta_hat - beta_1) / se_cluster_orig
       
       # Quantis bootstrap
-      q_lower <- quantile(t_boot, alpha/2, na.rm = TRUE)
-      q_upper <- quantile(t_boot, 1 - alpha/2, na.rm = TRUE)
-      rejections[r, 13] <- (t_original < q_lower) | (t_original > q_upper)
+      q_lower = quantile(t_boot, alpha/2, na.rm = TRUE)
+      q_upper = quantile(t_boot, 1 - alpha/2, na.rm = TRUE)
+      rejections[r, 13] = (t_original < q_lower) | (t_original > q_upper)
     }
-  }, error = function(e) rejections[r, 13] <- 0)
+  }, error = function(e) rejections[r, 13] = 0)
 }
 
 # Calcular taxas de rejeição e erros padrão
 for (i in 1:13) {
-  rejection_rate <- mean(rejections[, i])
-  std_error <- sqrt(rejection_rate * (1 - rejection_rate) / (R - 1))
+  rejection_rate = mean(rejections[, i])
+  std_error = sqrt(rejection_rate * (1 - rejection_rate) / (R - 1))
   
-  results[i, ] <- list(methods[i], rejection_rate, std_error)
+  results[i, ] = list(methods[i], rejection_rate, std_error)
 }
 
 # Mostrar resultados
@@ -344,13 +349,13 @@ for (i in 1:nrow(results)) {
 }
 
 cat("\nResultados esperados do paper (G = 5):\n")
-expected <- c(0.426, 0.130, 0.195, 0.088, 0.152, 0.047, 0.012, 
+expected = c(0.426, 0.130, 0.195, 0.088, 0.152, 0.047, 0.012, 
               0.161, 0.117, 0.081, 0.081, 0.034, 0.054)
 
 cat("Método                     | Obtido | Esperado | Diferença\n")
 cat("---------------------------|--------|----------|----------\n")
 for (i in 1:min(13, nrow(results))) {
-  diff <- results$rejection_rate[i] - expected[i]
+  diff = results$rejection_rate[i] - expected[i]
   cat(sprintf("%-25s | %.3f  | %.3f    | %+.3f\n", 
               substr(results$method[i], 1, 25), 
               results$rejection_rate[i], expected[i], diff))
