@@ -1,7 +1,7 @@
 ###################### Replication - Applied Econometrics ######################
 ################################# FGV EPGE #####################################
 ######################### Author: Gustavo Henrique #############################
-############################ Monte Carlo Simulations ###########################
+########################## Monte Carlo Simulations #############################
 
 #### Loading/Installing needed packages ####
 pacman::p_load(
