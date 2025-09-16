@@ -1,9 +1,10 @@
-# Por que o valor da taxa de rejeição não está perto?
-# note que  o teste BDM usou B1_hat do OLS normal ao invés  de H0 B1=1.
-# Logo, à depender do valor obtido pela regressão simples, a taxa de rejeição será discrepeante e o SE idem.
+# Meu Resultado: Rejection rate (α=0.05): 0.2770  (SE: 0.0142)
+# Resultado do Paper:  Rejection rate (α=0.05): 0.117  (SE: 0.010)
+# Erro meu ou do autor?
+
 
 # ================================================
-# Monte Carlo: BDM Bootstrap-t (pairs cluster + SE OLS i.i.d.)
+# Monte Carlo: Pairs Cluster Bootstrap-t com SE padrão (OLS)
 # ================================================
 import numpy as np
 import pandas as pd
@@ -44,49 +45,43 @@ def generate_data(G, NG, beta_0=0, beta_1=1):
     return pd.concat(data_list, ignore_index=True)
 
 # -----------------------------
-# OLS helpers (SE = OLS i.i.d., não-robusto)
+# OLS helpers (SE padrão)
 # -----------------------------
-def _ols_fit_iid(df):
+def _ols_beta_bse_default(df):
     """
-    Ajusta y ~ const + x via OLS padrão (iid).
-    Retorna (params[const,x], bse[const,x]) como arrays numpy.
+    Ajusta y ~ const + x via OLS com SE padrão (homocedástico).
+    Retorna (beta[const,x], se[const,x]).
     """
     X = sm.add_constant(df["x"].to_numpy())
     y = df["y"].to_numpy()
-    res = sm.OLS(y, X).fit()  # padrão = homocedástico (iid)
-    params = np.asarray(res.params, dtype=float)
-    bse    = np.asarray(res.bse, dtype=float)
-    return params, bse
+    res = sm.OLS(y, X).fit()  # sem cov_type => SE padrão
+    beta = np.asarray(res.params, dtype=float)
+    se   = np.asarray(res.bse,    dtype=float)
+    return beta, se
 
-def ols_beta1_and_iid_w(df, beta0):
+def ols_beta1_and_default_w(df, beta0):
     """
-    Estatística w (BDM) com SE OLS i.i.d.:
-    w = (beta1_hat - beta0) / se_iid(beta1_hat)
+    w = (beta1_hat - beta0) / se_OLS(beta1_hat), com SE padrão do OLS.
     """
-    params, bse = _ols_fit_iid(df)
-    beta1_hat = float(params[1])
-    se1_iid   = float(bse[1])
-    w = (beta1_hat - beta0) / se1_iid
-    return beta1_hat, se1_iid, w
+    beta_hat, se_hat = _ols_beta_bse_default(df)
+    se_beta1 = float(se_hat[1])
+    w = (float(beta_hat[1]) - beta0) / se_beta1
+    return float(beta_hat[1]), se_beta1, w
 
 # -----------------------------------------------------
-# Pairs cluster bootstrap-t (BDM: usa SE OLS i.i.d. em cada réplica)
+# Pairs cluster bootstrap-t (usando SE padrão em cada réplica)
 # -----------------------------------------------------
-def pairs_cluster_bootstrap_t_bdm(df, B=399, alpha=0.05, seed=20240916):
+def pairs_cluster_bootstrap_t_default(df, B=399, alpha=0.05, seed=20240916):
     """
     Retorna (q_low, q_high, wstars) onde
-      w*_b = (beta1*_b - beta1_hat) / se_iid(beta1*_b)
-    Passos:
-      - Reamostra G clusters com reposição (pairs).
-      - Re-rotula clusters como 1..G na pseudo-amostra.
-      - Ajusta OLS padrão (i.i.d.) na réplica e calcula t studentizado i.i.d.
-      - Âncora em beta1_hat (NÃO impõe H0).
+    w*_b = (beta1*_b - beta1_hat) / se_OLS(beta1*_b),
+    reamostrando clusters com reposição (pairs) e re-rotulando 1..G.
     """
     cluster_dfs = [g[1] for g in df.groupby("cluster", sort=True)]
     G_here = len(cluster_dfs)
 
-    # Âncora (beta1_hat) da amostra original com SE i.i.d.
-    beta1_hat, _, _ = ols_beta1_and_iid_w(df, beta0=beta1_H0)
+    # âncora: beta1_hat da amostra original
+    beta1_hat = float(_ols_beta_bse_default(df)[0][1])
 
     local_rng = default_rng(seed)
     wstars = np.empty(B, dtype=float)
@@ -100,10 +95,9 @@ def pairs_cluster_bootstrap_t_bdm(df, B=399, alpha=0.05, seed=20240916):
             parts.append(tmp)
         boot_df = pd.concat(parts, ignore_index=True)
 
-        params_b, bse_b = _ols_fit_iid(boot_df)
-        beta1_b = float(params_b[1])
-        se1_b   = float(bse_b[1])
-        wstars[b] = (beta1_b - beta1_hat) / se1_b
+        beta_b, se_b = _ols_beta_bse_default(boot_df)
+        se1_b = float(se_b[1])
+        wstars[b] = (float(beta_b[1]) - beta1_hat) / se1_b
 
     q_low  = float(np.quantile(wstars, alpha / 2))
     q_high = float(np.quantile(wstars, 1 - alpha / 2))
@@ -121,13 +115,13 @@ children_mc = base_ss_mc.spawn(R)
 for r in range(R):
     df = generate_data(G, NG)
 
-    # Passo 1: estatística w com SE = OLS i.i.d. (BDM)
-    beta1_hat, se_iid, w = ols_beta1_and_iid_w(df, beta0=beta1_H0)
+    # Passo 1: estatística w com SE padrão (OLS)
+    beta1_hat, se_ols, w = ols_beta1_and_default_w(df, beta0=beta1_H0)
     w_orig.append(w)
 
-    # Passos 2–3: quantis empíricos de w* (pairs BDM) e decisão
+    # Passos 2–3: quantis empíricos de w* (pairs) e decisão
     seed_r = int(children_mc[r].generate_state(1)[0])
-    q_low, q_high, _ = pairs_cluster_bootstrap_t_bdm(
+    q_low, q_high, _ = pairs_cluster_bootstrap_t_default(
         df, B=B, alpha=alpha, seed=seed_r
     )
     rej_flags.append(int((w < q_low) or (w > q_high)))
@@ -139,7 +133,8 @@ rej_flags = np.array(rej_flags, dtype=int)
 rej_rate = rej_flags.mean()
 rej_se   = np.sqrt(rej_rate * (1 - rej_rate) / R)
 
-print("==== Monte Carlo: BDM Bootstrap-t (pairs cluster + SE OLS i.i.d.) ====")
+print("==== Monte Carlo: Pairs Cluster Bootstrap-t com SE padrão (OLS) ====")
 print(f"Rejection rate (α={alpha:.2f}): {rej_rate:.4f}  (SE: {rej_se:.4f})")
 print(f"Média |w (original)|:          {np.mean(np.abs(w_orig)):.4f}")
 print(f"B = {B}, R = {R}, G = {G}, NG = {NG}")
+
