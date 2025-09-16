@@ -1,3 +1,6 @@
+# Meu Rejection rate (wild cluster bootstrap-t, B=399): 0.1610; Desvio-padrão da rejection rate:  0.0116
+# Deles Rejection rate (wild cluster bootstrap-t, B=399): 0.1520; Desvio-padrão da rejection rate: 0.0110
+
 # ================================================
 # Monte Carlo com Pairs Cluster Bootstrap-SE
 # ================================================
