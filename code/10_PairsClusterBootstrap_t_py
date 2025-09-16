@@ -1,0 +1,140 @@
+# ================================================
+# Monte Carlo com Pairs Cluster Bootstrap-t (CRVE)
+# ================================================
+import numpy as np
+import pandas as pd
+import statsmodels.api as sm
+from numpy.random import default_rng, SeedSequence
+
+# -----------------------------
+# Parâmetros
+# -----------------------------
+G = 5        # número de clusters
+NG = 30      # observações por cluster
+R = 1000     # replicações Monte Carlo
+B = 399      # reamostragens bootstrap (pairs cluster)
+beta_0 = 0
+beta_1 = 1
+alpha = 0.05
+
+rng = default_rng(42)  # RNG para o DGP
+
+# -----------------------------
+# DGP
+# -----------------------------
+def generate_data(G, NG, beta_0=0, beta_1=1):
+    zg    = rng.normal(size=G)    # componente comum em x
+    eps_g = rng.normal(size=G)    # componente comum no erro
+
+    data_list = []
+    for g in range(G):
+        zig   = rng.normal(size=NG)   # idiossincrático x
+        eps_i = rng.normal(size=NG)   # idiossincrático erro
+
+        xig = zg[g] + zig
+        uig = eps_g[g] + eps_i
+        yig = beta_0 + beta_1 * xig + uig
+
+        data_list.append(pd.DataFrame({"y": yig, "x": xig, "cluster": g + 1}))
+    return pd.concat(data_list, ignore_index=True)
+
+# ------------------------------------------
+# CRVE (eq. 3) e estatística w do passo 1
+# ------------------------------------------
+def ols_beta1_and_crve_w(df, beta0):
+    """
+    Retorna: beta1_hat, se_CRVE(beta1_hat), w = (beta1_hat - beta0)/se_CRVE
+    CRVE: V = (X'X)^(-1) [ sum_g X_g' (u_tilde_g u_tilde_g') X_g ] (X'X)^(-1),
+    com u_tilde_g = (G/(G-1)) u_g e u_g = y - X beta_hat (OLS).
+    """
+    X = sm.add_constant(df["x"].to_numpy())
+    y = df["y"].to_numpy()
+    clusters = df["cluster"].to_numpy()
+    G_here = len(np.unique(clusters))
+
+    res = sm.OLS(y, X).fit()
+    beta = res.params
+    u = res.resid
+    XTX_inv = np.linalg.inv(X.T @ X)
+
+    scale = (G_here / (G_here - 1)) if G_here > 1 else 1.0
+    S = np.zeros((X.shape[1], X.shape[1]))
+    for g in np.unique(clusters):
+        idx = (clusters == g)
+        Xg = X[idx, :]
+        ug = u[idx] * scale
+        S += Xg.T @ (ug[:, None] @ ug[None, :]) @ Xg
+
+    V = XTX_inv @ S @ XTX_inv
+    se_beta1 = float(np.sqrt(V[1, 1]))
+    beta1_hat = float(beta[1])
+    w = (beta1_hat - beta0) / se_beta1
+    return beta1_hat, se_beta1, w
+
+# -----------------------------------------------------
+# Pairs cluster bootstrap-t (passos 2a, 2b e 3)
+# -----------------------------------------------------
+def pairs_cluster_bootstrap_t(df, B=399, alpha=0.05, seed=20240916):
+    """Retorna (q_low, q_high, wstars) com quantis empíricos dos w*_b."""
+    # divide por cluster para reamostrar rapidamente
+    cluster_dfs = [g[1] for g in df.groupby("cluster", sort=True)]
+    G_here = len(cluster_dfs)
+
+    # Passo 2b precisa do beta1_hat original (âncora)
+    beta1_hat, _, _ = ols_beta1_and_crve_w(df, beta0=0.0)
+
+    ss = SeedSequence(seed)
+    local_rng = default_rng(ss)
+
+    wstars = np.empty(B)
+    for b in range(B):
+        sel = local_rng.integers(low=0, high=G_here, size=G_here)  # reamostra clusters
+        # reconstrói pseudo-amostra e re-rotula clusters como 1..G
+        parts = []
+        for j, idx in enumerate(sel):
+            tmp = cluster_dfs[idx].copy()
+            tmp["cluster"] = j + 1
+            parts.append(tmp)
+        boot_df = pd.concat(parts, ignore_index=True)
+
+        beta1_b, se1_b, _ = ols_beta1_and_crve_w(boot_df, beta0=beta1_hat)
+        wstars[b] = (beta1_b - beta1_hat) / se1_b
+
+    q_low  = float(np.quantile(wstars, alpha / 2))
+    q_high = float(np.quantile(wstars, 1 - alpha / 2))
+    return q_low, q_high, wstars
+
+# -----------------------------
+# Monte Carlo
+# -----------------------------
+beta1_H0 = 1.0  # H0: beta_1 = 1
+rej_flags = []
+w_orig = []
+
+base_ss_mc = SeedSequence(999)
+children_mc = base_ss_mc.spawn(R)
+
+for r in range(R):
+    df = generate_data(G, NG)
+
+    # Passo 1: estatística w com CRVE
+    beta1_hat, se_crve, w = ols_beta1_and_crve_w(df, beta0=beta1_H0)
+    w_orig.append(w)
+
+    # Passos 2–3: quantis de w* e decisão
+    q_low, q_high, _ = pairs_cluster_bootstrap_t(
+        df, B=B, alpha=alpha, seed=int(children_mc[r].generate_state(1)[0])
+    )
+    rej_flags.append(int((w < q_low) or (w > q_high)))
+
+# -----------------------------
+# Resultados
+# -----------------------------
+rej_flags = np.array(rej_flags, dtype=int)
+rej_rate = rej_flags.mean()
+rej_se   = np.sqrt(rej_rate * (1 - rej_rate) / R)
+
+print("==== Monte Carlo: Pairs Cluster Bootstrap-t (CRVE) ====")
+print(f"Rejection rate (α={alpha:.2f}): {rej_rate:.4f}  (SE: {rej_se:.4f})")
+print(f"Média |w (original)|:          {np.mean(np.abs(w_orig)):.4f}")
+print(f"B = {B}, R = {R}, G = {G}, NG = {NG}")
