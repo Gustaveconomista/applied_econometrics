@@ -1,8 +1,14 @@
+# Meu Rejection rate (wild cluster bootstrap-SE, B=399): 0.0180; Desvio-padrão da rejection rate: 0.0042 
+# Meu Rejection rate (wild cluster bootstrap-SE, B=399): 0.0190; Desvio-padrão da rejection rate: 0.0040
+
+# ================================================
+# Wild Cluster Bootstrap-SE (Cameron-Gelbach-Miller, 2008)
+# ================================================
 import numpy as np
 import pandas as pd
 import statsmodels.api as sm
 from numpy.random import default_rng
-from scipy.stats import t as tdist
+from scipy.stats import norm, t as tdist
 
 # -----------------------------
 # Parâmetros
@@ -20,7 +26,9 @@ rng = default_rng(42)
 # -----------------------------
 # DGP
 # -----------------------------
-def generate_data(G, NG, beta_0=0, beta_1=1):
+def generate_data(G, NG, beta_0=0, beta_1=1, rng=None):
+    if rng is None:
+        rng = default_rng()
     zg = rng.normal(size=G)        # componente comum em x
     eps_g = rng.normal(size=G)     # componente comum no erro
 
@@ -39,91 +47,123 @@ def generate_data(G, NG, beta_0=0, beta_1=1):
     return pd.concat(data_list, ignore_index=True)
 
 # -----------------------------
-# OLS (para obter beta_hat e resíduos)
+# OLS (para coletar beta1)
 # -----------------------------
-def fit_ols_return_resid(df):
+def fit_ols_beta1(df):
     X = sm.add_constant(df["x"].to_numpy())
     y = df["y"].to_numpy()
     ols = sm.OLS(y, X).fit()
-    beta_hat = ols.params.copy()
-    y_hat = X @ beta_hat
-    resid = y - y_hat
-    return beta_hat, resid, X
+    return float(ols.params[1])
 
 # -----------------------------
-# Wild Cluster Bootstrap-SE
-# - NÃO impõe H0; usa resíduos do modelo irrestrito
-# - y* = X * beta_hat + v_g * e_hat, v_g ~ Rademacher por cluster
-# - Reestima OLS em cada y* e coleta beta1*
-# - se_boot = sd(beta1*)
-# - Estatística do teste: t_SE = (beta1_hat - beta_true) / se_boot
-#   (Comparada a t_{G-1} bicaudal)
+# Pesos wild por cluster
+#   scheme='rademacher' (padrão) ou 'mammen'
 # -----------------------------
-def wild_cluster_bootstrap_se(df, B=399):
-    # Ajuste irrestrito e resíduos
-    beta_hat, resid, X = fit_ols_return_resid(df)
-    b1_hat = float(beta_hat[1])
-
-    clusters = df["cluster"].to_numpy()
+def draw_wild_weights(clusters, rng, scheme="rademacher"):
     uniq = np.unique(clusters)
+    w_by_cluster = {}
+    if scheme == "rademacher":
+        for g in uniq:
+            w_by_cluster[g] = rng.choice([-1.0, 1.0])  # 0.5/0.5
+    elif scheme == "mammen":
+        phi = np.sqrt(5.0)
+        a, b = (1.0 - phi) / 2.0, (1.0 + phi) / 2.0
+        p_a = 0.5 + 1.0 / (2.0 * phi)  # ~= 0.7236
+        for g in uniq:
+            w_by_cluster[g] = a if (rng.random() < p_a) else b
+    else:
+        raise ValueError("scheme deve ser 'rademacher' ou 'mammen'")
+    # mapeia p/ cada observação
+    return np.array([w_by_cluster[g] for g in clusters])
 
-    b1_star = np.empty(B)
+# -----------------------------
+# Wild Cluster Bootstrap-SE (CGM 2008)
+# Retorna: se_boot, wald, p_value
+# -----------------------------
+def wild_cluster_bootstrap_se(df, beta_true, B=399, rng=None,
+                              weight_scheme="rademacher",
+                              crit_dist="normal"):
+    """
+    crit_dist: 'normal' (padrão) ou 't' (usa df=G-1)
+    """
+    if rng is None:
+        rng = default_rng()
+    # 1) Estimativa original irrestrita
+    beta1_hat = fit_ols_beta1(df)
+
+    # 2) Ajuste restrito (impõe H0): regressa (y - beta_true*x) em constante
+    y = df["y"].to_numpy()
+    x = df["x"].to_numpy()
+    clusters = df["cluster"].to_numpy()
+    G = int(np.unique(clusters).size)
+
+    y_restr = y - beta_true * x
+    Xc = np.ones((len(df), 1))
+    ols_c = sm.OLS(y_restr, Xc).fit()
+    c_hat = float(ols_c.params[0])
+
+    y_hat0 = beta_true * x + c_hat
+    e0 = y - y_hat0  # resíduos sob H0
+
+    # 3) Réplicas bootstrap: gera y* = y_hat0 + w_g * e0
+    betas_star = np.empty(B)
+    X_full = sm.add_constant(x)
     for b in range(B):
-        # Pesos Rademacher por cluster
-        w = {g: rng.choice([-1.0, 1.0]) for g in uniq}
-        w_vec = np.array([w[g] for g in clusters])
+        w = draw_wild_weights(clusters, rng, scheme=weight_scheme)
+        y_star = y_hat0 + w * e0
+        ols_star = sm.OLS(y_star, X_full).fit()
+        betas_star[b] = float(ols_star.params[1])
 
-        # Gera y* e reestima OLS
-        y_star = (X @ beta_hat) + w_vec * resid
-        ols_star = sm.OLS(y_star, X).fit()
-        b1_star[b] = ols_star.params[1]
+    # 4) SE bootstrap = desvio-padrão dos betas* (Bessel, ddof=1)
+    se_boot = float(np.std(betas_star, ddof=1))
+    # prevenção contra degenerescência numérica
+    if not np.isfinite(se_boot) or se_boot <= 1e-12:
+        # se não há variabilidade, o teste não rejeita
+        return se_boot, np.nan, 1.0
 
-    # Erro-padrão bootstrap do estimador
-    se_boot = float(np.std(b1_star, ddof=1))
+    # 5) Estatística Wald com SE bootstrap
+    wald = (beta1_hat - beta_true) / se_boot
 
-    # fallback de estabilidade (raro, mas útil)
-    if not np.isfinite(se_boot) or se_boot == 0.0:
-        se_boot = np.nan
+    # 6) p-valor bicaudal
+    if crit_dist.lower() == "normal":
+        p_value = 2.0 * (1.0 - norm.cdf(abs(wald)))
+    elif crit_dist.lower() == "t":
+        df = max(G - 1, 1)
+        p_value = 2.0 * (1.0 - tdist.cdf(abs(wald), df=df))
+    else:
+        raise ValueError("crit_dist deve ser 'normal' ou 't'.")
 
-    return b1_hat, se_boot
+    return se_boot, float(wald), float(p_value)
 
 # -----------------------------
-# Monte Carlo usando o bootstrap-SE
-# Rejeita H0 se |t_SE| > t_{1-alpha/2, G-1}
+# Monte Carlo p/ tamanho do teste
 # -----------------------------
-def run_monte_carlo_wild_cluster_se(R, G, NG, beta_true=1.0, B=399, alpha=0.05):
+def run_monte_carlo_wild_cluster_se(R, G, NG, beta_true=1.0, B=399,
+                                    alpha=0.05, rng=None,
+                                    weight_scheme="rademacher",
+                                    crit_dist="normal"):
+    if rng is None:
+        rng = default_rng()
     rejects = []
-    se_samples = []
-
-    # ponto de corte t com G-1 g.l.
-    tcrit = tdist.ppf(1 - alpha/2, df=G - 1)
-
     for r in range(R):
-        df = generate_data(G, NG, beta_0=0, beta_1=beta_true)
-
-        b1_hat, se_boot = wild_cluster_bootstrap_se(df, B=B)
-
-        # Se o se_boot vier NaN (degenerado), não rejeita por segurança
-        if not np.isfinite(se_boot) or se_boot == 0.0:
-            rejects.append(False)
-            continue
-
-        t_se = (b1_hat - beta_true) / se_boot
-        rejects.append(abs(t_se) > tcrit)
-        se_samples.append(se_boot)
+        df = generate_data(G, NG, beta_0=0, beta_1=beta_true, rng=rng)
+        se_b, wald, pval = wild_cluster_bootstrap_se(
+            df, beta_true=beta_true, B=B, rng=rng,
+            weight_scheme=weight_scheme, crit_dist=crit_dist
+        )
+        rejects.append(pval < alpha)
 
     rejection_rate = float(np.mean(rejects))
     sd_rejection = float(np.sqrt(rejection_rate * (1 - rejection_rate) / R))
-    avg_se_boot = float(np.mean(se_samples)) if len(se_samples) > 0 else np.nan
-    return rejection_rate, sd_rejection, avg_se_boot
+    return rejection_rate, sd_rejection
 
 # -----------------------------
-# Executar
+# Executar (ex.: crítico Normal + Rademacher)
 # -----------------------------
-rejection_rate, sd_rej, avg_se = run_monte_carlo_wild_cluster_se(
-    R=R, G=G, NG=NG, beta_true=beta_1, B=B, alpha=alpha
-)
-
-print(f"Rejection rate (wild cluster bootstrap-SE, B={B}): {rejection_rate:.4f}")
-print(f"Desvio-padrão da rejection rate: {sd_rej:.4f}")
-print(f"Média do SE bootstrap (beta1): {avg_se:.4f}")
+if __name__ == "__main__":
+    rej, sd_rej = run_monte_carlo_wild_cluster_se(
+        R=R, G=G, NG=NG, beta_true=beta_1, B=B, alpha=alpha,
+        rng=rng, weight_scheme="rademacher", crit_dist="normal"
+    )
+    print(f"Rejection rate (wild cluster bootstrap-SE, B={B}): {rej:.4f}")
+    print(f"Desvio-padrão da rejection rate: {sd_rej:.4f}")
