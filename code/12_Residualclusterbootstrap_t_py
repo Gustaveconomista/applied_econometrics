@@ -1,0 +1,185 @@
+# Meu Rejection rate (cluster residual bootstrap-t, H0 imposto, B=399): 0.0470; Desvio-padrão da rejection rate: 0.0067
+# Dele Rejection rate (cluster residual bootstrap-t, H0 imposto, B=399): 0.034; Desvio-padrão da rejection rate: 0.0060
+
+import numpy as np
+import pandas as pd
+import statsmodels.api as sm
+from numpy.random import default_rng
+
+# -----------------------------
+# Parâmetros
+# -----------------------------
+G = 5       # número de clusters
+NG = 30     # observações por cluster
+R = 1000    # replicações Monte Carlo
+B = 399     # bootstraps (cluster residual bootstrap-t, H0 imposto)
+beta_0 = 0
+beta_1 = 1
+alpha = 0.05
+
+rng = default_rng(42)
+
+# -----------------------------
+# DGP
+# -----------------------------
+def generate_data(G, NG, beta_0=0, beta_1=1):
+    zg = rng.normal(size=G)        # componente comum em x
+    eps_g = rng.normal(size=G)     # componente comum no erro
+
+    data_list = []
+    for g in range(G):
+        zig   = rng.normal(size=NG)    # idiossincrático x
+        eps_i = rng.normal(size=NG)    # idiossincrático erro
+
+        xig = zg[g] + zig
+        uig = eps_g[g] + eps_i
+        yig = beta_0 + beta_1 * xig + uig
+
+        data_list.append(pd.DataFrame({
+            "y": yig, "x": xig, "cluster": g + 1
+        }))
+    return pd.concat(data_list, ignore_index=True)
+
+# -----------------------------
+# OLS + SE cluster-robusto (helper)
+# -----------------------------
+def fit_ols_cluster(df):
+    X = sm.add_constant(df["x"].to_numpy())
+    y = df["y"].to_numpy()
+    ols = sm.OLS(y, X).fit()
+
+    groups = df["cluster"].to_numpy()
+    rob = ols.get_robustcov_results(
+        cov_type="cluster",
+        groups=groups,
+        use_correction=True,  # mesma correção em todas as etapas
+        df_correction=True
+    )
+    beta1_hat = rob.params[1]
+    se_beta1  = rob.bse[1]
+    return beta1_hat, se_beta1
+
+# -----------------------------
+# Ajuste restrito (H0 imposto) e resíduos por cluster
+# -----------------------------
+def restricted_fit_and_cluster_residuals(df, beta_true):
+    """
+    Impõe H0: beta1 = beta_true.
+    Regride y - beta_true*x em constante, pega c_hat^R.
+    Retorna betaR = (c_hat^R, beta_true) e a lista de resíduos por cluster,
+    escalados por G/(G-1) (pequeno ajuste amostral).
+    """
+    y = df["y"].to_numpy()
+    x = df["x"].to_numpy()
+    clusters = df["cluster"].to_numpy()
+    G_here = len(np.unique(clusters))
+
+    y_restr = y - beta_true * x
+    Xc = np.ones((len(y_restr), 1))
+    ols_c = sm.OLS(y_restr, Xc).fit()
+    cR = float(ols_c.params[0])
+
+    yhat0 = beta_true * x + cR
+    uR = y - yhat0
+
+    # escala por G/(G-1)
+    scale = G_here / (G_here - 1)
+    uR_scaled = scale * uR
+
+    # separa vetores por cluster
+    res_by_cluster = []
+    X_by_cluster = []
+    for g in sorted(np.unique(clusters)):
+        idx = (clusters == g)
+        res_by_cluster.append(uR_scaled[idx].copy())
+        # guarda X_g (const, x) usado depois para gerar y*
+        X_by_cluster.append(np.column_stack([np.ones(idx.sum()), x[idx]]))
+
+    betaR = np.array([cR, beta_true], dtype=float)
+    return betaR, res_by_cluster, X_by_cluster
+
+# -----------------------------
+# Cluster residual bootstrap-t (H0 imposto)
+# -----------------------------
+def cluster_residual_bootstrap_t_H0(df, beta_true, B=399, alpha=0.05):
+    """
+    Implementa o algoritmo CGM:
+      1) w = (b1_hat - beta_true)/se_cluster(b1_hat)
+      2) Para b=1..B:
+         - Reamostra G vetores de resíduos restritos por cluster
+         - Gera y*_g = X_g betaR + u_g^{R*}
+         - Estima b1*_b, se*_b e w*_b = (b1*_b - beta_true)/se*_b
+      3) Rejeita H0 se w < q_{alpha/2}(w*) ou w > q_{1-alpha/2}(w*)
+    Retorna (padrão): (q_low, q_high, w_obs, wstars)
+    """
+    # 1) Estatística observada com SE cluster-robusto
+    b1_hat, se1 = fit_ols_cluster(df)
+    w_obs = (b1_hat - beta_true) / se1
+
+    # 1b) Ajuste restrito e resíduos por cluster (escalados)
+    betaR, res_by_cluster, X_by_cluster = restricted_fit_and_cluster_residuals(df, beta_true)
+    G_here = len(res_by_cluster)
+
+    # 2) B réplicas
+    wstars = np.empty(B, dtype=float)
+
+    for b in range(B):
+        # (a) reamostra G vetores de resíduos restritos por cluster
+        donor_idx = rng.integers(low=0, high=G_here, size=G_here)
+
+        # forma y* usando sempre X_g "do g" e resíduos do cluster "donor"
+        y_star_parts = []
+        cluster_parts = []
+        x_star_parts = []
+
+        for g in range(G_here):
+            u_g_star = res_by_cluster[donor_idx[g]]
+            X_g = X_by_cluster[g]
+            # tamanhos iguais se NG é fixo; aqui é o seu caso
+            y_g_star = X_g @ betaR + u_g_star
+            y_star_parts.append(y_g_star)
+            x_star_parts.append(X_g[:, 1])           # segunda coluna é x
+            cluster_parts.append(np.full(X_g.shape[0], g + 1))
+
+        y_star = np.concatenate(y_star_parts)
+        x_star = np.concatenate(x_star_parts)
+        cl_star = np.concatenate(cluster_parts)
+
+        df_star = pd.DataFrame({"y": y_star, "x": x_star, "cluster": cl_star})
+
+        # (b) estima irrestrito na amostra b e computa w*_b
+        b1_star, se1_star = fit_ols_cluster(df_star)
+        wstars[b] = (b1_star - beta_true) / se1_star
+
+    # 3) quantis empíricos
+    q_low  = float(np.quantile(wstars, alpha/2))
+    q_high = float(np.quantile(wstars, 1 - alpha/2))
+    return q_low, q_high, float(w_obs), wstars
+
+# -----------------------------
+# Monte Carlo (tamanho do teste)
+# -----------------------------
+def run_monte_carlo_cluster_residual(R, G, NG, beta_true=1.0, B=399, alpha=0.05):
+    rejects = []
+
+    for r in range(R):
+        df = generate_data(G, NG, beta_0=0, beta_1=beta_true)
+
+        qL, qH, w_obs, _ = cluster_residual_bootstrap_t_H0(
+            df, beta_true=beta_true, B=B, alpha=alpha
+        )
+        rejects.append(int((w_obs < qL) or (w_obs > qH)))
+
+    rejection_rate = float(np.mean(rejects))
+    sd_rejection = float(np.sqrt(rejection_rate * (1 - rejection_rate) / R))
+    return rejection_rate, sd_rejection
+
+# -----------------------------
+# Executar
+# -----------------------------
+rejection_rate, sd_rej = run_monte_carlo_cluster_residual(
+    R=R, G=G, NG=NG, beta_true=beta_1, B=B, alpha=alpha
+)
+
+print(f"Rejection rate (cluster residual bootstrap-t, H0 imposto, B={B}): {rejection_rate:.4f}")
+print(f"Desvio-padrão da rejection rate: {sd_rej:.4f}")
