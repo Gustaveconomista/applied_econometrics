@@ -1,0 +1,151 @@
+# ================================================
+# Monte Carlo com Pairs Cluster Bootstrap-SE
+# ================================================
+import numpy as np
+import pandas as pd
+import statsmodels.api as sm
+from numpy.random import default_rng, SeedSequence
+from scipy.stats import t, norm
+from joblib import Parallel, delayed  # opcional (pode remover se não quiser paralelizar)
+
+# -----------------------------
+# Parâmetros
+# -----------------------------
+G = 5        # número de clusters
+NG = 30      # observações por cluster
+R = 1000     # replicações Monte Carlo
+B = 399      # reamostragens bootstrap (pairs cluster)
+beta_0 = 0
+beta_1 = 1
+alpha = 0.05
+
+N_JOBS = -1  # paralelização do passo-b (use 1 para desativar)
+rng = default_rng(42)
+
+# -----------------------------
+# DGP
+# -----------------------------
+def generate_data(G, NG, beta_0=0, beta_1=1):
+    zg    = rng.normal(size=G)    # componente comum em x
+    eps_g = rng.normal(size=G)    # componente comum no erro
+
+    data_list = []
+    for g in range(G):
+        zig   = rng.normal(size=NG)   # idiossincrático x
+        eps_i = rng.normal(size=NG)   # idiossincrático erro
+
+        xig = zg[g] + zig
+        uig = eps_g[g] + eps_i
+        yig = beta_0 + beta_1 * xig + uig
+
+        data_list.append(pd.DataFrame({"y": yig, "x": xig, "cluster": g + 1}))
+    return pd.concat(data_list, ignore_index=True)
+
+# -----------------------------
+# OLS helper (beta_1)
+# -----------------------------
+def ols_beta1(df):
+    X = sm.add_constant(df["x"].to_numpy())
+    y = df["y"].to_numpy()
+    return sm.OLS(y, X).fit().params[1]
+
+# -----------------------------
+# Pairs Cluster Bootstrap-SE
+# -----------------------------
+def _one_boot_beta(df, clusters, ss_b):
+    # ss_b é SeedSequence filho para reprodutibilidade por b
+    local_rng = default_rng(ss_b.generate_state(2, dtype=np.uint32))
+    boot_clusters = local_rng.choice(clusters, size=len(clusters), replace=True)
+    # empilha clusters selecionados
+    boot_df = pd.concat([df.loc[df["cluster"] == g] for g in boot_clusters], ignore_index=True)
+    return ols_beta1(boot_df)
+
+def pairs_cluster_bootstrap_se(df, B=399, n_jobs=1, base_ss=None):
+    """
+    Implementa o algoritmo da imagem:
+      1) Estime beta_hat no original (feito fora desta função)
+      2) Para b=1..B: reamostre clusters com reposição e estime beta1*_b
+      3) s_hat = sqrt( (1/(B-1)) * sum_b (beta1*_b - mean_beta1*)^2 )
+    Retorna: (s_hat, beta_star_mean, betas_star)
+    """
+    clusters = np.array(sorted(df["cluster"].unique()))
+    # árvore de seeds (reprodutível + paralelizável)
+    if base_ss is None:
+        base_ss = SeedSequence(12345)
+    children = base_ss.spawn(B)
+
+    if n_jobs == 1:
+        betas_star = np.array([_one_boot_beta(df, clusters, children[b]) for b in range(B)])
+    else:
+        betas_star = np.array(
+            Parallel(n_jobs=n_jobs, prefer="processes")(
+                delayed(_one_boot_beta)(df, clusters, children[b]) for b in range(B)
+            )
+        )
+
+    beta_star_mean = np.mean(betas_star)
+    s_hat = np.sqrt(np.sum((betas_star - beta_star_mean) ** 2) / (B - 1))
+    return s_hat, beta_star_mean, betas_star
+
+# -----------------------------
+# Monte Carlo
+# -----------------------------
+betas = []
+tvals = []
+w_bse_vals = []
+reject_flags_t = []
+reject_flags_bse = []
+
+dfree = G * NG - 2
+t_crit = t.ppf(1 - alpha / 2, df=dfree)       # critério t (apenas para referência)
+z_crit = norm.ppf(1 - alpha / 2)              # critério normal para w_BSE
+
+base_ss_mc = SeedSequence(999)  # raiz de seeds para os bootstraps por replicação
+
+for r in range(R):
+    df = generate_data(G, NG)
+
+    # Estimativa original
+    X = sm.add_constant(df["x"])
+    y = df["y"]
+    model = sm.OLS(y, X).fit()
+    beta1 = model.params["x"]
+    se1   = model.bse["x"]  # SE OLS usual (não-robusto) – apenas para t de referência
+    tval  = (beta1 - 1.0) / se1
+
+    # Bootstrap-SE (pairs cluster)
+    s_hat, beta_star_mean, _ = pairs_cluster_bootstrap_se(
+        df, B=B, n_jobs=N_JOBS, base_ss=base_ss_mc.spawn(1)[0]
+    )
+    w_bse = (beta1 - 1.0) / s_hat
+
+    # Armazenamento
+    betas.append(beta1)
+    tvals.append(tval)
+    w_bse_vals.append(w_bse)
+    reject_flags_t.append(int(abs(tval) > t_crit))         # apenas informativo
+    reject_flags_bse.append(int(abs(w_bse) > z_crit))      # *** teste BSE ***
+
+# -----------------------------
+# Resultados
+# -----------------------------
+betas = np.array(betas)
+tvals = np.array(tvals)
+w_bse_vals = np.array(w_bse_vals)
+reject_flags_t = np.array(reject_flags_t)
+reject_flags_bse = np.array(reject_flags_bse)
+
+rej_rate_t   = reject_flags_t.mean()
+rej_se_t     = np.sqrt(rej_rate_t * (1 - rej_rate_t) / R)
+
+rej_rate_bse = reject_flags_bse.mean()
+rej_se_bse   = np.sqrt(rej_rate_bse * (1 - rej_rate_bse) / R)
+
+print("==== Monte Carlo com Pairs Cluster Bootstrap-SE ====")
+print(f"Média de beta_1:                {betas.mean():.4f}")
+print(f"Desvio de beta_1:               {betas.std(ddof=1):.4f}")
+print(f"Média de |t OLS|:               {np.mean(np.abs(tvals)):.4f}")
+print(f"Média de |w_BSE|:               {np.mean(np.abs(w_bse_vals)):.4f}")
+print(f"Taxa de rejeição t (ref.):      {rej_rate_t:.4f}  (SE: {rej_se_t:.4f})")
+print(f"Taxa de rejeição BSE (final):   {rej_rate_bse:.4f}  (SE: {rej_se_bse:.4f})")
+print(f"Crítico usado no BSE: z_{1-alpha/2:.3f} = {z_crit:.4f}  (normal)")
