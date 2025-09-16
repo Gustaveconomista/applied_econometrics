@@ -1,0 +1,167 @@
+# Meu Rejection rate (wild cluster bootstrap-t, B=399): 0.0620; Desvio-padrão da rejection rate:0.0076
+# Deles Rejection rate (wild cluster bootstrap-t, B=399): 0.0470; Desvio-padrão da rejection rate: 0.0070
+
+# ================================================
+# Residual Cluster Bootstrap-SE (Cameron-Gelbach-Miller, 2008)
+# ================================================
+import numpy as np
+import pandas as pd
+import statsmodels.api as sm
+from numpy.random import default_rng
+from scipy.stats import norm, t as tdist
+
+# -----------------------------
+# Parâmetros
+# -----------------------------
+G = 5       # número de clusters
+NG = 30     # observações por cluster (assumimos balanceado)
+R = 1000    # replicações Monte Carlo
+B = 399     # reamostragens bootstrap (Residual cluster bootstrap-SE)
+beta_0 = 0
+beta_1 = 1
+alpha = 0.05
+rng = default_rng(42)
+
+# -----------------------------
+# DGP
+# -----------------------------
+def generate_data(G, NG, beta_0=0, beta_1=1, rng=None):
+    if rng is None:
+        rng = default_rng()
+    zg = rng.normal(size=G)
+    eps_g = rng.normal(size=G)
+    data_list = []
+    for g in range(G):
+        zig   = rng.normal(size=NG)
+        eps_i = rng.normal(size=NG)
+        xig = zg[g] + zig
+        uig = eps_g[g] + eps_i
+        yig = beta_0 + beta_1 * xig + uig
+        data_list.append(pd.DataFrame({"y":yig, "x":xig, "cluster":g+1}))
+    return pd.concat(data_list, ignore_index=True)
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def fit_ols(df):
+    X = sm.add_constant(df["x"].to_numpy())
+    y = df["y"].to_numpy()
+    return sm.OLS(y, X).fit()
+
+def split_by_cluster(arr, clusters):
+    """Devolve dicionário g -> vetor (na ordem em que aparecem)."""
+    out = {}
+    uniq = np.unique(clusters)
+    for g in uniq:
+        out[g] = arr[clusters == g]
+    return out
+
+def assemble_from_source_vectors(template_clusters, source_vectors, source_order):
+    """
+    Monta um vetor 'u*' do tamanho N: para cada cluster de destino (na ordem
+    de uniq(template)), escolhe um cluster-fonte segundo 'source_order' e copia
+    TODO o vetor de resíduos desse cluster-fonte.
+    Requer tamanhos de cluster balanceados.
+    """
+    uniq_dest = np.unique(template_clusters)
+    u_star = np.empty_like(template_clusters, dtype=float)
+    for j, g_dest in enumerate(uniq_dest):
+        g_src = source_order[j]
+        u_src_vec = source_vectors[g_src]
+        idx = np.where(template_clusters == g_dest)[0]
+        # Assume NG constante; copia 1-para-1
+        u_star[idx] = u_src_vec
+    return u_star
+
+# -----------------------------
+# Residual Cluster Bootstrap-SE
+# -----------------------------
+def residual_cluster_bootstrap_se(
+    df, beta_true, B=399, rng=None, impose_null=True, crit_dist="normal"
+):
+    """
+    SE por bootstrap = desvio-padrão de beta1*.
+    impose_null=True -> usa resíduos RESTRITOS (centrados em H0).
+    impose_null=False -> usa resíduos irrestritos.
+    crit_dist: 'normal' ou 't' (df=G-1) para p-valor do teste Wald.
+    """
+    if rng is None:
+        rng = default_rng()
+
+    y = df["y"].to_numpy()
+    x = df["x"].to_numpy()
+    clusters = df["cluster"].to_numpy()
+    uniq = np.unique(clusters)
+    G = uniq.size
+    X_full = sm.add_constant(x)
+
+    # 1) Ajuste base e resíduos (restritos ou não)
+    if impose_null:
+        # Regride (y - beta_true*x) em constante
+        y_restr = y - beta_true * x
+        c_hat = sm.OLS(y_restr, np.ones((len(y_restr), 1))).fit().params[0]
+        y_base = beta_true * x + c_hat     # ajuste sob H0
+        resid  = y - y_base                # resíduos "restritos"
+        beta_hat = sm.OLS(y, X_full).fit().params[1]  # para o teste Wald
+    else:
+        fit = sm.OLS(y, X_full).fit()
+        y_base = fit.fittedvalues          # ajuste irrestrito
+        resid  = fit.resid                 # resíduos OLS
+        beta_hat = fit.params[1]
+
+    # Residual vectors por cluster
+    resid_by_g = split_by_cluster(resid, clusters)
+
+    # 2) Réplicas: reamostragem de VETORES de resíduos por cluster, com reposição
+    betas_star = np.empty(B)
+    for b in range(B):
+        # sorteia, com reposição, uma lista de clusters-fonte (tamanho G)
+        source_order = rng.choice(uniq, size=G, replace=True)
+        # monta u* colando o vetor de resíduos sorteado para cada cluster destino
+        u_star = assemble_from_source_vectors(clusters, resid_by_g, source_order)
+        # constrói y* e reestima
+        y_star = y_base + u_star
+        betas_star[b] = sm.OLS(y_star, X_full).fit().params[1]
+
+    # 3) SE bootstrap = sd(betas*)
+    se_boot = float(np.std(betas_star, ddof=1))
+    if not np.isfinite(se_boot) or se_boot <= 1e-12:
+        return se_boot, np.nan, 1.0
+
+    # 4) Wald e p-valor (bicaudal)
+    wald = (beta_hat - beta_true) / se_boot
+    if crit_dist.lower() == "normal":
+        p_value = 2.0 * (1.0 - norm.cdf(abs(wald)))
+    else:
+        dfree = max(G - 1, 1)
+        p_value = 2.0 * (1.0 - tdist.cdf(abs(wald), df=dfree))
+    return se_boot, float(wald), float(p_value)
+
+# -----------------------------
+# Monte Carlo (tamanho do teste)
+# -----------------------------
+def run_mc_residual_cluster_se(R, G, NG, beta_true=1.0, B=399, alpha=0.05,
+                               rng=None, impose_null=True, crit_dist="normal"):
+    if rng is None:
+        rng = default_rng()
+    flags = []
+    for r in range(R):
+        df = generate_data(G, NG, beta_0=0, beta_1=beta_true, rng=rng)
+        se_b, wald, pval = residual_cluster_bootstrap_se(
+            df, beta_true, B=B, rng=rng, impose_null=impose_null, crit_dist=crit_dist
+        )
+        flags.append(pval < alpha)
+    rate = float(np.mean(flags))
+    sd   = float(np.sqrt(rate * (1 - rate) / R))
+    return rate, sd
+
+# -----------------------------
+# Executar: impondo H0 e crítico Normal
+# -----------------------------
+if __name__ == "__main__":
+    rej, sd = run_mc_residual_cluster_se(
+        R=R, G=G, NG=NG, beta_true=beta_1, B=B, alpha=alpha,
+        rng=rng, impose_null=True, crit_dist="normal"
+    )
+    print(f"Rejection rate (Residual cluster bootstrap-SE, B={B}): {rej:.4f}")
+    print(f"Desvio-padrão da rejection rate: {sd:.4f}")

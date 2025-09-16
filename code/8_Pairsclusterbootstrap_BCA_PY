@@ -1,0 +1,169 @@
+# Meu Rejection rate (α=0.05): 0.1920  (SE: 0.0125)
+# Deles Rejection rate (α=0.05): 0.161  (SE: 0.012)
+
+
+# ================================================
+# Monte Carlo: Pairs Cluster Bootstrap — BCa (OLS)
+# ================================================
+import numpy as np
+import pandas as pd
+import statsmodels.api as sm
+from numpy.random import default_rng, SeedSequence
+from scipy.stats import norm
+
+# -----------------------------
+# Parâmetros
+# -----------------------------
+G = 5        # número de clusters
+NG = 30      # observações por cluster
+R = 1000     # replicações Monte Carlo
+B = 399      # réplicas bootstrap (pairs por cluster)
+beta_0 = 0
+beta_1 = 1
+alpha = 0.05
+beta1_H0 = 1.0  # H0: beta_1 = 1
+
+rng = default_rng(42)  # RNG do DGP
+
+# -----------------------------
+# DGP
+# -----------------------------
+def generate_data(G, NG, beta_0=0, beta_1=1):
+    zg    = rng.normal(size=G)    # componente comum em x
+    eps_g = rng.normal(size=G)    # componente comum no erro
+
+    data_list = []
+    for g in range(G):
+        zig   = rng.normal(size=NG)   # idiossincrático x
+        eps_i = rng.normal(size=NG)   # idiossincrático erro
+
+        xig = zg[g] + zig
+        uig = eps_g[g] + eps_i
+        yig = beta_0 + beta_1 * xig + uig
+
+        data_list.append(pd.DataFrame({"y": yig, "x": xig, "cluster": g + 1}))
+    return pd.concat(data_list, ignore_index=True)
+
+# -----------------------------
+# Estimador (OLS) do beta1
+# -----------------------------
+def ols_beta1(df):
+    """Retorna o coeficiente de x em y ~ const + x (OLS com SE padrão; SE não é usado no BCa)."""
+    X = sm.add_constant(df["x"].to_numpy())
+    y = df["y"].to_numpy()
+    res = sm.OLS(y, X).fit()
+    return float(res.params[1])
+
+# -----------------------------
+# Jackknife por cluster (delete-1)
+# -----------------------------
+def jackknife_by_cluster(df, cluster_col="cluster"):
+    """Retorna vetor com betas leave-one-cluster-out."""
+    thetas_jack = []
+    for g in sorted(df[cluster_col].unique()):
+        thetas_jack.append(ols_beta1(df[df[cluster_col] != g]))
+    return np.array(thetas_jack, dtype=float)
+
+# -----------------------------
+# Pairs cluster bootstrap de beta1
+# -----------------------------
+def pairs_cluster_bootstrap_beta1(df, B=399, seed=20240916):
+    """
+    Reamostra G clusters com reposição (pairs) e retorna {beta1*_b}_{b=1..B}.
+    """
+    cluster_dfs = [g[1] for g in df.groupby("cluster", sort=True)]
+    G_here = len(cluster_dfs)
+    local_rng = default_rng(seed)
+
+    betas_boot = np.empty(B, dtype=float)
+    for b in range(B):
+        sel = local_rng.integers(low=0, high=G_here, size=G_here)
+        parts = []
+        for j, idx in enumerate(sel):
+            tmp = cluster_dfs[idx].copy()
+            tmp["cluster"] = j + 1
+            parts.append(tmp)
+        boot_df = pd.concat(parts, ignore_index=True)
+        betas_boot[b] = ols_beta1(boot_df)
+    return betas_boot
+
+# -----------------------------
+# Intervalo BCa
+# -----------------------------
+def bca_interval(theta_hat, thetas_boot, thetas_jack, alpha=0.05, eps=1e-12):
+    """
+    Retorna (lo, hi, extras) para o IC BCa de nível 1-alpha.
+    theta_hat   : estimativa na amostra original (float)
+    thetas_boot : array (B,) com estimativas bootstrap
+    thetas_jack : array (G,) com estimativas jackknife delete-1 cluster
+    """
+    thetas_boot = np.asarray(thetas_boot, dtype=float)
+    thetas_jack = np.asarray(thetas_jack, dtype=float)
+
+    # z0 (correção de viés)
+    prop = np.mean(thetas_boot < theta_hat)
+    prop = np.clip(prop, eps, 1 - eps)
+    z0 = norm.ppf(prop)
+
+    # a (aceleração) via jackknife
+    tbar = np.mean(thetas_jack)
+    u = tbar - thetas_jack
+    num = np.sum(u**3)
+    den = 6.0 * (np.sum(u**2) ** 1.5)
+    a = (num / den) if den > 0 else 0.0
+
+    # quantis ajustados
+    zL, zU = norm.ppf(alpha/2), norm.ppf(1 - alpha/2)
+
+    def adj_prob(z):
+        denom = max(1 - a*(z0 + z), eps)
+        return norm.cdf(z0 + (z0 + z)/denom)
+
+    aL = float(np.clip(adj_prob(zL), 0.0 + eps, 1.0 - eps))
+    aU = float(np.clip(adj_prob(zU), 0.0 + eps, 1.0 - eps))
+
+    lo = float(np.quantile(thetas_boot, aL))
+    hi = float(np.quantile(thetas_boot, aU))
+    return lo, hi, {"z0": float(z0), "a": float(a), "aL": aL, "aU": aU}
+
+# -----------------------------
+# Monte Carlo (teste via IC BCa)
+# -----------------------------
+rej_flags = []
+ci_lengths = []
+
+base_ss_mc = SeedSequence(999)
+children_mc = base_ss_mc.spawn(R)
+
+for r in range(R):
+    df = generate_data(G, NG)
+
+    # Estimativa original
+    beta1_hat = ols_beta1(df)
+
+    # Bootstrap pairs por cluster (distribuição de beta1*)
+    seed_r = int(children_mc[r].generate_state(1)[0])
+    betas_boot = pairs_cluster_bootstrap_beta1(df, B=B, seed=seed_r)
+
+    # Jackknife por cluster (delete-1) para aceleração
+    betas_jack = jackknife_by_cluster(df)
+
+    # IC BCa para beta1
+    lo, hi, extra = bca_interval(beta1_hat, betas_boot, betas_jack, alpha=alpha)
+    ci_lengths.append(hi - lo)
+
+    # Teste H0: beta1 = beta1_H0  <=>  rejeita se beta1_H0 não está no IC
+    rej_flags.append(int((beta1_H0 < lo) or (beta1_H0 > hi)))
+
+# -----------------------------
+# Resultados
+# -----------------------------
+rej_flags = np.array(rej_flags, dtype=int)
+rej_rate  = rej_flags.mean()
+rej_se    = np.sqrt(rej_rate * (1 - rej_rate) / R)
+avg_len   = float(np.mean(ci_lengths))
+
+print("==== Monte Carlo: Pairs Cluster BCa (OLS) ====")
+print(f"Rejection rate (α={alpha:.2f}): {rej_rate:.4f}  (SE: {rej_se:.4f})")
+print(f"Média do comprimento do IC:     {avg_len:.4f}")
+print(f"B = {B}, R = {R}, G = {G}, NG = {NG}")

@@ -1,0 +1,160 @@
+# ================================================
+# Monte Carlo: Pairs Cluster Bootstrap-t com CR3
+# (jackknife por cluster para o SE)
+# ================================================
+import numpy as np
+import pandas as pd
+import statsmodels.api as sm
+from numpy.random import default_rng, SeedSequence
+
+# -----------------------------
+# Parâmetros
+# -----------------------------
+G = 5        # número de clusters
+NG = 30      # observações por cluster
+R = 1000     # replicações Monte Carlo
+B = 399      # réplicas bootstrap (pairs)
+beta_0 = 0
+beta_1 = 1
+alpha = 0.05
+beta1_H0 = 1.0  # H0: beta_1 = 1
+
+rng = default_rng(42)  # RNG do DGP
+
+# -----------------------------
+# DGP
+# -----------------------------
+def generate_data(G, NG, beta_0=0, beta_1=1):
+    zg    = rng.normal(size=G)    # componente comum em x
+    eps_g = rng.normal(size=G)    # componente comum no erro
+
+    data_list = []
+    for g in range(G):
+        zig   = rng.normal(size=NG)   # idiossincrático x
+        eps_i = rng.normal(size=NG)   # idiossincrático erro
+
+        xig = zg[g] + zig
+        uig = eps_g[g] + eps_i
+        yig = beta_0 + beta_1 * xig + uig
+
+        data_list.append(pd.DataFrame({"y": yig, "x": xig, "cluster": g + 1}))
+    return pd.concat(data_list, ignore_index=True)
+
+# -----------------------------
+# OLS helpers
+# -----------------------------
+def _ols_beta(df):
+    """Retorna vetor beta (const, x) estimado por OLS em y ~ const + x."""
+    X = sm.add_constant(df["x"].to_numpy())
+    y = df["y"].to_numpy()
+    res = sm.OLS(y, X).fit()
+    return np.asarray(res.params, dtype=float)  # <- FIX: sem .values
+
+def _cr3_vcov_jackknife(df):
+    """
+    CR3 (jackknife por cluster):
+    V_CR3 = ((G-1)/G) * sum_g (beta^{(-g)} - beta_bar) ( ... )'
+    onde beta^{(-g)} é OLS excluindo o cluster g.
+    Retorna a matriz 2x2 da variância-covariância dos coeficientes [const, x].
+    """
+    clusters = np.array(sorted(df["cluster"].unique()))
+    G_here = len(clusters)
+    if G_here < 2:
+        raise ValueError("CR3 requer G >= 2 clusters.")
+
+    betas_lo = []
+    for g in clusters:
+        df_lo = df.loc[df["cluster"] != g]
+        betas_lo.append(_ols_beta(df_lo))
+    betas_lo = np.asarray(betas_lo)              # shape: (G, 2)
+    beta_bar = betas_lo.mean(axis=0)             # shape: (2,)
+
+    diffs = betas_lo - beta_bar                  # (G, 2)
+    V = (G_here - 1) / G_here * (diffs.T @ diffs)
+    return V
+
+def ols_beta1_and_cr3_w(df, beta0):
+    """
+    Estatística w usando CR3:
+    w = (beta1_hat - beta0) / se_CR3(beta1_hat),
+    onde se_CR3 vem de V_CR3 calculada por jackknife por cluster.
+    """
+    beta_hat = _ols_beta(df)                     # [const, x]
+    V_cr3    = _cr3_vcov_jackknife(df)           # 2x2
+    se_beta1 = float(np.sqrt(V_cr3[1, 1]))
+    w = (float(beta_hat[1]) - beta0) / se_beta1
+    return float(beta_hat[1]), se_beta1, w
+
+# -----------------------------------------------------
+# Pairs cluster bootstrap-t (com CR3 dentro de cada b)
+# -----------------------------------------------------
+def pairs_cluster_bootstrap_t_cr3(df, B=399, alpha=0.05, seed=20240916):
+    """
+    Retorna (q_low, q_high, wstars) onde w*_b = (beta1*_b - beta1_hat) / se_CR3(beta1*_b).
+    - Reamostra G clusters com reposição (pairs).
+    - Re-rotula clusters como 1..G na pseudo-amostra.
+    - Calcula CR3 na própria pseudo-amostra (jackknife por cluster).
+    - Quantis empíricos de w* definem a regra de decisão.
+    """
+    # lista de dataframes por cluster para acelerar o pairs
+    cluster_dfs = [g[1] for g in df.groupby("cluster", sort=True)]
+    G_here = len(cluster_dfs)
+
+    # âncora: beta1_hat da amostra original
+    beta1_hat = _ols_beta(df)[1]
+
+    local_rng = default_rng(seed)
+    wstars = np.empty(B, dtype=float)
+
+    for b in range(B):
+        sel = local_rng.integers(low=0, high=G_here, size=G_here)  # reamostra clusters
+        parts = []
+        for j, idx in enumerate(sel):
+            tmp = cluster_dfs[idx].copy()
+            tmp["cluster"] = j + 1  # re-rotula 1..G
+            parts.append(tmp)
+        boot_df = pd.concat(parts, ignore_index=True)
+
+        beta1_b = _ols_beta(boot_df)[1]
+        V_b     = _cr3_vcov_jackknife(boot_df)
+        se1_b   = float(np.sqrt(V_b[1, 1]))
+        wstars[b] = (beta1_b - beta1_hat) / se1_b
+
+    q_low  = float(np.quantile(wstars, alpha / 2))
+    q_high = float(np.quantile(wstars, 1 - alpha / 2))
+    return q_low, q_high, wstars
+
+# -----------------------------
+# Monte Carlo
+# -----------------------------
+rej_flags = []
+w_orig = []
+
+base_ss_mc = SeedSequence(999)
+children_mc = base_ss_mc.spawn(R)
+
+for r in range(R):
+    df = generate_data(G, NG)
+
+    # Passo 1: estatística w com SE = CR3 (jackknife por cluster)
+    beta1_hat, se_cr3, w = ols_beta1_and_cr3_w(df, beta0=beta1_H0)
+    w_orig.append(w)
+
+    # Passos 2–3: quantis empíricos de w* (pairs) e decisão
+    seed_r = int(children_mc[r].generate_state(1)[0])
+    q_low, q_high, _ = pairs_cluster_bootstrap_t_cr3(
+        df, B=B, alpha=alpha, seed=seed_r
+    )
+    rej_flags.append(int((w < q_low) or (w > q_high)))
+
+# -----------------------------
+# Resultados
+# -----------------------------
+rej_flags = np.array(rej_flags, dtype=int)
+rej_rate = rej_flags.mean()
+rej_se   = np.sqrt(rej_rate * (1 - rej_rate) / R)
+
+print("==== Monte Carlo: Pairs Cluster Bootstrap-t com CR3 ====")
+print(f"Rejection rate (α={alpha:.2f}): {rej_rate:.4f}  (SE: {rej_se:.4f})")
+print(f"Média |w (original)|:          {np.mean(np.abs(w_orig)):.4f}")
+print(f"B = {B}, R = {R}, G = {G}, NG = {NG}")

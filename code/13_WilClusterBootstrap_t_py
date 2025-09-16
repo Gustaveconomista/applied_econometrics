@@ -1,3 +1,6 @@
+# Meu Rejection rate (wild cluster bootstrap-t, B=399): 0.0620; Desvio-padrão da rejection rate: 0.0076
+# Deles Rejection rate (wild cluster bootstrap-t, B=399): 0.0.054; Desvio-padrão da rejection rate: 0.007
+
 import numpy as np
 import pandas as pd
 import statsmodels.api as sm
