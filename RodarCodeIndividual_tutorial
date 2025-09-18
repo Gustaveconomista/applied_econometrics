@@ -1,0 +1,230 @@
+# É preciso alterar poucas coisas do FullCode, ele é muito pesado e o PC nao aguenta.
+#São elas:
+# Colocar individualmente a função do bootstrap desejado em # MÉTODO
+# Colocar a função que vai rodar em # LISTA DE MÉTODOS DISPONÍVEIS
+# Escolher o número de clusters na linha 176 ( 5,10 ou 15. Não colocar todos de uma vez)
+# Corrigir path para salvar (linha 217).
+#Testar com 10 R=10 e B=3 só pra ver se ta indo.
+# Exemplo de como fica para G=5 e MÉTODO 1: PAIRS CLUSTER BOOTSTRAP-SE.
+
+# ================================================
+# Monte Carlo com múltiplos bootstraps(5-13)
+# para 6 DGPs × G ∈ {5,10,15}, com paralelização e CSV
+# ================================================
+
+# --- bloquear threads internas do BLAS ---
+import os
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+
+import numpy as np
+import pandas as pd
+import statsmodels.api as sm
+from numpy.random import default_rng, SeedSequence
+from scipy.stats import t, norm, t as tdist
+from joblib import Parallel, delayed
+from datetime import datetime
+
+# ------------------------------------------
+# PARÂMETROS GERAIS
+# ------------------------------------------
+NG    = 30
+R     = 1000
+B     = 399
+beta_0 = 0
+beta_1 = 1
+alpha  = 0.05
+N_WORKERS = 6
+
+rng = default_rng(42)
+
+# ------------------------------------------
+# DGPs HOMO
+# ------------------------------------------
+def generate_data_normal(G, NG, beta_0=0, beta_1=1):
+    zg, eps_g = rng.normal(size=G), rng.normal(size=G)
+    frames = []
+    for g in range(G):
+        zig, eps_i = rng.normal(size=NG), rng.normal(size=NG)
+        xig = zg[g]+zig; uig = eps_g[g]+eps_i
+        y = beta_0+beta_1*xig+uig
+        frames.append(pd.DataFrame({"y":y,"x":xig,"cluster":g+1}))
+    return pd.concat(frames,ignore_index=True)
+
+def generate_data_exp_centered(G, NG, beta_0=0, beta_1=1):
+    zg, eps_g = rng.exponential(size=G)-1.0, rng.exponential(size=G)-1.0
+    frames = []
+    for g in range(G):
+        zig, eps_i = rng.exponential(size=NG)-1.0, rng.exponential(size=NG)-1.0
+        xig = zg[g]+zig; uig = eps_g[g]+eps_i
+        y = beta_0+beta_1*xig+uig
+        frames.append(pd.DataFrame({"y":y,"x":xig,"cluster":g+1}))
+    return pd.concat(frames,ignore_index=True)
+
+def generate_data_uniform(G, NG, beta_0=0, beta_1=1):
+    a,b = -np.sqrt(3), np.sqrt(3)
+    zg, eps_g = rng.uniform(a,b,G), rng.uniform(a,b,G)
+    frames = []
+    for g in range(G):
+        zig, eps_i = rng.uniform(a,b,NG), rng.uniform(a,b,NG)
+        xig = zg[g]+zig; uig = eps_g[g]+eps_i
+        y = beta_0+beta_1*xig+uig
+        frames.append(pd.DataFrame({"y":y,"x":xig,"cluster":g+1}))
+    return pd.concat(frames,ignore_index=True)
+
+# ------------------------------------------
+# DGPs HETERO
+# ------------------------------------------
+def generate_data_hetero_normal(G, NG, beta_0=0, beta_1=1):
+    zg, eps_g = rng.normal(size=G), rng.normal(size=G)
+    frames=[]
+    for g in range(G):
+        zig=rng.normal(size=NG); xig=zg[g]+zig
+        sd=3*np.abs(xig); eps_i=rng.normal(size=NG)*sd
+        uig=eps_g[g]+eps_i; y=beta_0+beta_1*xig+uig
+        frames.append(pd.DataFrame({"y":y,"x":xig,"cluster":g+1}))
+    return pd.concat(frames,ignore_index=True)
+
+def generate_data_hetero_exp_centered(G, NG, beta_0=0, beta_1=1):
+    zg, eps_g = rng.exponential(size=G)-1.0, rng.exponential(size=G)-1.0
+    frames=[]
+    for g in range(G):
+        zig=rng.exponential(size=NG)-1.0; xig=zg[g]+zig
+        sd=3*np.abs(xig); base=rng.exponential(size=NG)-1.0; eps_i=sd*base
+        uig=eps_g[g]+eps_i; y=beta_0+beta_1*xig+uig
+        frames.append(pd.DataFrame({"y":y,"x":xig,"cluster":g+1}))
+    return pd.concat(frames,ignore_index=True)
+
+def generate_data_hetero_uniform(G, NG, beta_0=0, beta_1=1):
+    a,b=-np.sqrt(3),np.sqrt(3)
+    zg, eps_g = rng.uniform(a,b,G), rng.uniform(a,b,G)
+    frames=[]
+    for g in range(G):
+        zig=rng.uniform(a,b,NG); xig=zg[g]+zig
+        sd=3*np.abs(xig); base=rng.uniform(a,b,NG); eps_i=sd*base
+        uig=eps_g[g]+eps_i; y=beta_0+beta_1*xig+uig
+        frames.append(pd.DataFrame({"y":y,"x":xig,"cluster":g+1}))
+    return pd.concat(frames,ignore_index=True)
+
+dgps = [
+    ("HOMO  Normal(0,1)",            generate_data_normal),
+    ("HOMO  Exp(1)-1",               generate_data_exp_centered),
+    ("HOMO  Uniforme(-√3,√3)",       generate_data_uniform),
+    ("HETERO Normal var=9x^2",       generate_data_hetero_normal),
+    ("HETERO Exp-centr var=9x^2",    generate_data_hetero_exp_centered),
+    ("HETERO Unif var=9x^2",         generate_data_hetero_uniform),
+]
+
+# ------------------------------------------
+# MÉTODO 1: PAIRS CLUSTER BOOTSTRAP-SE
+# ------------------------------------------
+def ols_beta1(df):
+    X = sm.add_constant(df["x"].to_numpy())
+    y = df["y"].to_numpy()
+    return sm.OLS(y, X).fit().params[1]
+
+def _one_boot_beta(df, clusters, ss_b):
+    local_rng = default_rng(ss_b.generate_state(2, dtype=np.uint32))
+    boot_clusters = local_rng.choice(clusters, size=len(clusters), replace=True)
+    boot_df = pd.concat([df.loc[df["cluster"] == g] for g in boot_clusters], ignore_index=True)
+    return ols_beta1(boot_df)
+
+def pairs_cluster_bootstrap_se(df, B=399, base_ss=None):
+    clusters = np.array(sorted(df["cluster"].unique()))
+    if base_ss is None:
+        base_ss = SeedSequence(12345)
+    children = base_ss.spawn(B)
+    betas_star = np.array([_one_boot_beta(df, clusters, children[b]) for b in range(B)])
+    mu = np.mean(betas_star)
+    s_hat = np.sqrt(np.sum((betas_star - mu)**2)/(B-1))
+    return s_hat
+
+def run_mc_pairs(G, dgp_fn, NG=30, R=1000, B=399, alpha=0.05,
+                 seed_data=42, seed_boot=999):
+    global rng; rng = default_rng(seed_data)
+    rej_flags=[]; base_ss_mc = SeedSequence(seed_boot)
+    dfree = G*NG - 2
+    z_crit = norm.ppf(1 - alpha/2)
+    for r in range(R):
+        df = dgp_fn(G,NG,beta_0=beta_0,beta_1=beta_1)
+        X = sm.add_constant(df["x"]); y=df["y"]
+        m=sm.OLS(y,X).fit(); b1=m.params["x"]
+        s_hat = pairs_cluster_bootstrap_se(df,B,base_ss=base_ss_mc.spawn(1)[0])
+        w = (b1-1.0)/s_hat
+        rej_flags.append(int(abs(w)>z_crit))
+    rate=np.mean(rej_flags); se=np.sqrt(rate*(1-rate)/R)
+    return {"rej":rate,"rej_se":se,"crit":z_crit,"dfree":dfree}
+
+
+# ------------------------------------------
+# LISTA DE MÉTODOS DISPONÍVEIS
+# (adicione novos aqui facilmente depois)
+# ------------------------------------------
+bootstrap_methods = [
+    ("pairs", run_mc_pairs) 
+]
+
+
+
+
+# ------------------------------------------
+# EXECUÇÃO PARA TODOS DGP × G × MÉTODO
+# ------------------------------------------
+if __name__ == "__main__":
+    tasks=[]
+    base_ss=SeedSequence(2025)
+    for name,fn in dgps:
+        for G_target in [5]:
+            for mname,_ in bootstrap_methods:
+                ss=base_ss.spawn(1)[0]
+                sd=int(ss.generate_state(1,dtype=np.uint32)[0]+1_000_000)
+                sb=int(ss.generate_state(1,dtype=np.uint32)[0]+2_000_000)
+                tasks.append((name,fn,G_target,mname,sd,sb))
+
+    def _one(idx,name,fn,G,mname,sd,sb):
+        method_fn = dict(bootstrap_methods)[mname]
+        res = method_fn(G,fn,NG=NG,R=R,B=B,alpha=alpha,
+                        seed_data=sd,seed_boot=sb)
+        return (idx,name,G,mname,res)
+
+    results = Parallel(n_jobs=N_WORKERS,prefer="processes")(
+        delayed(_one)(i,n,f,G,m,sd,sb)
+        for i,(n,f,G,m,sd,sb) in enumerate(tasks)
+    )
+
+    # montar CSV
+    rows=[]
+    for _,name,G,m,res in sorted(results,key=lambda x:x[0]):
+        print(f"\n== DGP: {name} | G={G} | Método: {m} ==")
+        print(f"Taxa de rejeição: {res['rej']:.4f} (SE: {res['rej_se']:.4f})")
+        rows.append({
+            "dgp":name, "G":G, "bootstrap":m,
+            "rej":res['rej'], "rej_se":res['rej_se'],
+            "crit":res['crit'], "dfree":res['dfree'],
+            "R":R,"B":B,"NG":NG,"alpha":alpha
+        })
+
+    df_out=pd.DataFrame(rows)
+    df_out.to_csv("results_mc_all_bootstraps.csv",index=False)
+    stamp=datetime.now().strftime("%Y%m%d_%H%M%S")
+    df_out.to_csv(f"results_mc_all_bootstraps_{stamp}.csv",index=False)
+
+    print("\nResultados salvos em CSV.")
+    
+from pathlib import Path
+from datetime import datetime
+
+downloads = Path(r"C:\Users\joaol\Downloads")
+downloads.mkdir(exist_ok=True)
+
+stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+base_name = f"results_mc_all_bootstraps_{stamp}.csv"
+out_path = downloads / base_name
+
+# salva o resultado com timestamp e também a versão "mais recente"
+df_out.to_csv(out_path, index=False)
+df_out.to_csv(downloads / "results_mc_all_bootstraps.csv", index=False)
+
+print(f"\n✅ Resultados salvos em: {out_path}")
