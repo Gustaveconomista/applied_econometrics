@@ -1,1 +1,770 @@
 
+# ================================================
+# Monte Carlo com múltiplos bootstraps(5-13)
+# para 6 DGPs × G ∈ {5,10,15}, com paralelização e CSV
+# ================================================
+
+# --- bloquear threads internas do BLAS ---
+import os
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+
+import numpy as np
+import pandas as pd
+import statsmodels.api as sm
+from numpy.random import default_rng, SeedSequence
+from scipy.stats import t, norm, t as tdist
+from joblib import Parallel, delayed
+from datetime import datetime
+
+# ------------------------------------------
+# PARÂMETROS GERAIS
+# ------------------------------------------
+NG    = 30
+R     = 1000
+B     = 399
+beta_0 = 0
+beta_1 = 1
+alpha  = 0.05
+N_WORKERS = 6
+
+rng = default_rng(42)
+
+# ------------------------------------------
+# DGPs HOMO
+# ------------------------------------------
+def generate_data_normal(G, NG, beta_0=0, beta_1=1):
+    zg, eps_g = rng.normal(size=G), rng.normal(size=G)
+    frames = []
+    for g in range(G):
+        zig, eps_i = rng.normal(size=NG), rng.normal(size=NG)
+        xig = zg[g]+zig; uig = eps_g[g]+eps_i
+        y = beta_0+beta_1*xig+uig
+        frames.append(pd.DataFrame({"y":y,"x":xig,"cluster":g+1}))
+    return pd.concat(frames,ignore_index=True)
+
+def generate_data_exp_centered(G, NG, beta_0=0, beta_1=1):
+    zg, eps_g = rng.exponential(size=G)-1.0, rng.exponential(size=G)-1.0
+    frames = []
+    for g in range(G):
+        zig, eps_i = rng.exponential(size=NG)-1.0, rng.exponential(size=NG)-1.0
+        xig = zg[g]+zig; uig = eps_g[g]+eps_i
+        y = beta_0+beta_1*xig+uig
+        frames.append(pd.DataFrame({"y":y,"x":xig,"cluster":g+1}))
+    return pd.concat(frames,ignore_index=True)
+
+def generate_data_uniform(G, NG, beta_0=0, beta_1=1):
+    a,b = -np.sqrt(3), np.sqrt(3)
+    zg, eps_g = rng.uniform(a,b,G), rng.uniform(a,b,G)
+    frames = []
+    for g in range(G):
+        zig, eps_i = rng.uniform(a,b,NG), rng.uniform(a,b,NG)
+        xig = zg[g]+zig; uig = eps_g[g]+eps_i
+        y = beta_0+beta_1*xig+uig
+        frames.append(pd.DataFrame({"y":y,"x":xig,"cluster":g+1}))
+    return pd.concat(frames,ignore_index=True)
+
+# ------------------------------------------
+# DGPs HETERO
+# ------------------------------------------
+def generate_data_hetero_normal(G, NG, beta_0=0, beta_1=1):
+    zg, eps_g = rng.normal(size=G), rng.normal(size=G)
+    frames=[]
+    for g in range(G):
+        zig=rng.normal(size=NG); xig=zg[g]+zig
+        sd=3*np.abs(xig); eps_i=rng.normal(size=NG)*sd
+        uig=eps_g[g]+eps_i; y=beta_0+beta_1*xig+uig
+        frames.append(pd.DataFrame({"y":y,"x":xig,"cluster":g+1}))
+    return pd.concat(frames,ignore_index=True)
+
+def generate_data_hetero_exp_centered(G, NG, beta_0=0, beta_1=1):
+    zg, eps_g = rng.exponential(size=G)-1.0, rng.exponential(size=G)-1.0
+    frames=[]
+    for g in range(G):
+        zig=rng.exponential(size=NG)-1.0; xig=zg[g]+zig
+        sd=3*np.abs(xig); base=rng.exponential(size=NG)-1.0; eps_i=sd*base
+        uig=eps_g[g]+eps_i; y=beta_0+beta_1*xig+uig
+        frames.append(pd.DataFrame({"y":y,"x":xig,"cluster":g+1}))
+    return pd.concat(frames,ignore_index=True)
+
+def generate_data_hetero_uniform(G, NG, beta_0=0, beta_1=1):
+    a,b=-np.sqrt(3),np.sqrt(3)
+    zg, eps_g = rng.uniform(a,b,G), rng.uniform(a,b,G)
+    frames=[]
+    for g in range(G):
+        zig=rng.uniform(a,b,NG); xig=zg[g]+zig
+        sd=3*np.abs(xig); base=rng.uniform(a,b,NG); eps_i=sd*base
+        uig=eps_g[g]+eps_i; y=beta_0+beta_1*xig+uig
+        frames.append(pd.DataFrame({"y":y,"x":xig,"cluster":g+1}))
+    return pd.concat(frames,ignore_index=True)
+
+dgps = [
+    ("HOMO  Normal(0,1)",            generate_data_normal),
+    ("HOMO  Exp(1)-1",               generate_data_exp_centered),
+    ("HOMO  Uniforme(-√3,√3)",       generate_data_uniform),
+    ("HETERO Normal var=9x^2",       generate_data_hetero_normal),
+    ("HETERO Exp-centr var=9x^2",    generate_data_hetero_exp_centered),
+    ("HETERO Unif var=9x^2",         generate_data_hetero_uniform),
+]
+
+# ------------------------------------------
+# MÉTODO 1: PAIRS CLUSTER BOOTSTRAP-SE
+# ------------------------------------------
+def ols_beta1(df):
+    X = sm.add_constant(df["x"].to_numpy())
+    y = df["y"].to_numpy()
+    return sm.OLS(y, X).fit().params[1]
+
+def _one_boot_beta(df, clusters, ss_b):
+    local_rng = default_rng(ss_b.generate_state(2, dtype=np.uint32))
+    boot_clusters = local_rng.choice(clusters, size=len(clusters), replace=True)
+    boot_df = pd.concat([df.loc[df["cluster"] == g] for g in boot_clusters], ignore_index=True)
+    return ols_beta1(boot_df)
+
+def pairs_cluster_bootstrap_se(df, B=399, base_ss=None):
+    clusters = np.array(sorted(df["cluster"].unique()))
+    if base_ss is None:
+        base_ss = SeedSequence(12345)
+    children = base_ss.spawn(B)
+    betas_star = np.array([_one_boot_beta(df, clusters, children[b]) for b in range(B)])
+    mu = np.mean(betas_star)
+    s_hat = np.sqrt(np.sum((betas_star - mu)**2)/(B-1))
+    return s_hat
+
+def run_mc_pairs(G, dgp_fn, NG=30, R=1000, B=399, alpha=0.05,
+                 seed_data=42, seed_boot=999):
+    global rng; rng = default_rng(seed_data)
+    rej_flags=[]; base_ss_mc = SeedSequence(seed_boot)
+    dfree = G*NG - 2
+    z_crit = norm.ppf(1 - alpha/2)
+    for r in range(R):
+        df = dgp_fn(G,NG,beta_0=beta_0,beta_1=beta_1)
+        X = sm.add_constant(df["x"]); y=df["y"]
+        m=sm.OLS(y,X).fit(); b1=m.params["x"]
+        s_hat = pairs_cluster_bootstrap_se(df,B,base_ss=base_ss_mc.spawn(1)[0])
+        w = (b1-1.0)/s_hat
+        rej_flags.append(int(abs(w)>z_crit))
+    rate=np.mean(rej_flags); se=np.sqrt(rate*(1-rate)/R)
+    return {"rej":rate,"rej_se":se,"crit":z_crit,"dfree":dfree}
+
+# ------------------------------------------
+# MÉTODO 2: RESIDUAL CLUSTER BOOTSTRAP-SE (CGM)
+# ------------------------------------------
+def _split_by_cluster(arr, clusters):
+    out={}; 
+    for g in np.unique(clusters): out[g]=arr[clusters==g]
+    return out
+
+def _assemble_from_source_vectors(template_clusters, source_vectors, source_order):
+    uniq_dest = np.unique(template_clusters)
+    u_star = np.empty_like(template_clusters,dtype=float)
+    for j,g_dest in enumerate(uniq_dest):
+        g_src=source_order[j]; vec=source_vectors[g_src]
+        idx=np.where(template_clusters==g_dest)[0]; u_star[idx]=vec
+    return u_star
+
+def residual_cluster_bootstrap_se(df,beta_true,B=399,base_ss=None,impose_null=True):
+    if base_ss is None: base_ss=SeedSequence(12345)
+    children = base_ss.spawn(B)
+    y,x = df["y"].to_numpy(), df["x"].to_numpy()
+    clusters = df["cluster"].to_numpy()
+    uniq=np.unique(clusters); G=len(uniq)
+    X_full = sm.add_constant(x)
+    if impose_null:
+        y_r = y - beta_true*x
+        c = sm.OLS(y_r, np.ones((len(y_r),1))).fit().params[0]
+        y_base = beta_true*x+c
+        resid = y-y_base
+        b1 = sm.OLS(y,X_full).fit().params[1]
+    else:
+        fit=sm.OLS(y,X_full).fit()
+        y_base=fit.fittedvalues; resid=fit.resid; b1=fit.params[1]
+    resid_by_g=_split_by_cluster(resid,clusters)
+    betas_star=[]
+    for b in range(B):
+        local_rng=default_rng(children[b].generate_state(2,dtype=np.uint32))
+        src=local_rng.choice(uniq,size=G,replace=True)
+        u_star=_assemble_from_source_vectors(clusters,resid_by_g,src)
+        y_star=y_base+u_star
+        betas_star.append(sm.OLS(y_star,X_full).fit().params[1])
+    s_boot=np.std(betas_star,ddof=1)
+    w = (b1-beta_true)/s_boot
+    p=2*(1-norm.cdf(abs(w)))
+    return p
+
+def run_mc_residual(G,dgp_fn,NG=30,R=1000,B=399,alpha=0.05,
+                    seed_data=42,seed_boot=999):
+    global rng; rng = default_rng(seed_data)
+    rej=[]; base_ss_mc=SeedSequence(seed_boot)
+    for r in range(R):
+        df=dgp_fn(G,NG,beta_0=beta_0,beta_1=beta_1)
+        p=residual_cluster_bootstrap_se(df,beta_true=beta_1,B=B,
+            base_ss=base_ss_mc.spawn(1)[0])
+        rej.append(p<alpha)
+    rate=np.mean(rej); se=np.sqrt(rate*(1-rate)/R)
+    return {"rej":rate,"rej_se":se,"crit":norm.ppf(1-alpha/2),"dfree":G*NG-2}
+
+# ------------------------------------------
+# MÉTODO 3: WILD CLUSTER BOOTSTRAP-SE (CGM 2008)
+# ------------------------------------------
+def _draw_wild_weights(clusters, rng, scheme="rademacher"):
+    uniq = np.unique(clusters)
+    w_by_cluster = {}
+    if scheme == "rademacher":
+        for g in uniq:
+            w_by_cluster[g] = rng.choice([-1.0, 1.0])
+    elif scheme == "mammen":
+        phi = np.sqrt(5.0)
+        a, b = (1.0 - phi) / 2.0, (1.0 + phi) / 2.0
+        p_a = 0.5 + 1.0 / (2.0 * phi)  # ~= 0.7236
+        for g in uniq:
+            w_by_cluster[g] = a if rng.random() < p_a else b
+    else:
+        raise ValueError("scheme deve ser 'rademacher' ou 'mammen'")
+    return np.array([w_by_cluster[g] for g in clusters])
+
+def wild_cluster_bootstrap_se(df, beta_true, B=399, base_ss=None,
+                              weight_scheme="rademacher", crit_dist="normal"):
+    """
+    Wild Cluster Bootstrap-SE (Cameron-Gelbach-Miller, 2008)
+    Retorna p-valor do teste Wald usando SE bootstrap.
+    """
+    if base_ss is None:
+        base_ss = SeedSequence(12345)
+    children = base_ss.spawn(B)
+
+    y = df["y"].to_numpy()
+    x = df["x"].to_numpy()
+    clusters = df["cluster"].to_numpy()
+    G = len(np.unique(clusters))
+    X_full = sm.add_constant(x)
+
+    # Ajuste original irrestrito
+    beta1_hat = sm.OLS(y, X_full).fit().params[1]
+
+    # Ajuste restrito (H0)
+    y_restr = y - beta_true * x
+    c_hat = sm.OLS(y_restr, np.ones((len(y_restr), 1))).fit().params[0]
+    y_hat0 = beta_true * x + c_hat
+    e0 = y - y_hat0
+
+    # Réplicas wild
+    betas_star = np.empty(B)
+    for b in range(B):
+        local_rng = default_rng(children[b].generate_state(2, dtype=np.uint32))
+        w = _draw_wild_weights(clusters, local_rng, scheme=weight_scheme)
+        y_star = y_hat0 + w * e0
+        betas_star[b] = sm.OLS(y_star, X_full).fit().params[1]
+
+    se_boot = float(np.std(betas_star, ddof=1))
+    if not np.isfinite(se_boot) or se_boot <= 1e-12:
+        return 1.0  # p-valor=1 se não há variação
+
+    wald = (beta1_hat - beta_true) / se_boot
+    if crit_dist.lower() == "normal":
+        p = 2*(1-norm.cdf(abs(wald)))
+    else:
+        p = 2*(1-tdist.cdf(abs(wald), df=max(G-1,1)))
+    return p
+
+def run_mc_wild(G, dgp_fn, NG=30, R=1000, B=399, alpha=0.05,
+                seed_data=42, seed_boot=999,
+                weight_scheme="rademacher"):
+    global rng; rng = default_rng(seed_data)
+    rej = []
+    base_ss_mc = SeedSequence(seed_boot)
+    for r in range(R):
+        df = dgp_fn(G, NG, beta_0=beta_0, beta_1=beta_1)
+        p = wild_cluster_bootstrap_se(
+            df, beta_true=beta_1, B=B,
+            base_ss=base_ss_mc.spawn(1)[0],
+            weight_scheme=weight_scheme
+        )
+        rej.append(p < alpha)
+    rate = np.mean(rej); se = np.sqrt(rate*(1-rate)/R)
+    return {"rej":rate,"rej_se":se,"crit":norm.ppf(1-alpha/2),"dfree":G*NG-2}
+
+# ------------------------------------------
+# MÉTODO 4: PAIRS CLUSTER BOOTSTRAP — BCa
+# ------------------------------------------
+def _ols_beta1(df):
+    X = sm.add_constant(df["x"].to_numpy())
+    y = df["y"].to_numpy()
+    return float(sm.OLS(y, X).fit().params[1])
+
+def _jackknife_by_cluster(df):
+    out = []
+    for g in sorted(df["cluster"].unique()):
+        out.append(_ols_beta1(df[df["cluster"] != g]))
+    return np.array(out, dtype=float)
+
+def _pairs_cluster_bootstrap_beta1(df, B=399, base_ss=None):
+    cluster_dfs = [g[1] for g in df.groupby("cluster", sort=True)]
+    G_here = len(cluster_dfs)
+    if base_ss is None:
+        base_ss = SeedSequence(12345)
+    child_ss = base_ss.spawn(B)
+    betas = np.empty(B)
+    for b in range(B):
+        local_rng = default_rng(child_ss[b].generate_state(2, dtype=np.uint32))
+        sel = local_rng.integers(low=0, high=G_here, size=G_here)
+        parts=[]
+        for j,idx in enumerate(sel):
+            tmp = cluster_dfs[idx].copy()
+            tmp["cluster"]=j+1
+            parts.append(tmp)
+        boot_df = pd.concat(parts, ignore_index=True)
+        betas[b] = _ols_beta1(boot_df)
+    return betas
+
+def _bca_interval(theta_hat, thetas_boot, thetas_jack, alpha=0.05, eps=1e-12):
+    thetas_boot = np.asarray(thetas_boot, dtype=float)
+    thetas_jack = np.asarray(thetas_jack, dtype=float)
+    # z0
+    prop = np.clip(np.mean(thetas_boot < theta_hat), eps, 1-eps)
+    z0 = norm.ppf(prop)
+    # aceleração
+    tbar = np.mean(thetas_jack)
+    u = tbar - thetas_jack
+    num = np.sum(u**3); den = 6.0 * (np.sum(u**2)**1.5)
+    a = (num/den) if den>0 else 0.0
+    # limites ajustados
+    zL, zU = norm.ppf(alpha/2), norm.ppf(1-alpha/2)
+    def adj_prob(z):
+        denom = max(1 - a*(z0+z), eps)
+        return norm.cdf(z0 + (z0+z)/denom)
+    aL = np.clip(adj_prob(zL), eps, 1-eps)
+    aU = np.clip(adj_prob(zU), eps, 1-eps)
+    lo = float(np.quantile(thetas_boot, aL))
+    hi = float(np.quantile(thetas_boot, aU))
+    return lo, hi
+
+def run_mc_bca(G, dgp_fn, NG=30, R=1000, B=399, alpha=0.05,
+               seed_data=42, seed_boot=999, beta1_H0=1.0):
+    global rng; rng = default_rng(seed_data)
+    base_ss_mc = SeedSequence(seed_boot)
+    rejs=[]; lens=[]
+    for r in range(R):
+        df = dgp_fn(G, NG, beta_0=beta_0, beta_1=beta_1)
+        beta1_hat = _ols_beta1(df)
+        betas_boot = _pairs_cluster_bootstrap_beta1(
+            df, B=B, base_ss=base_ss_mc.spawn(1)[0])
+        betas_jack = _jackknife_by_cluster(df)
+        lo, hi = _bca_interval(beta1_hat, betas_boot, betas_jack, alpha=alpha)
+        lens.append(hi-lo)
+        rejs.append(int((beta1_H0<lo) or (beta1_H0>hi)))
+    rate=np.mean(rejs); se=np.sqrt(rate*(1-rate)/R)
+    avg_len=np.mean(lens)
+    return {"rej":rate,"rej_se":se,"avg_len":avg_len,
+            "crit":norm.ppf(1-alpha/2),"dfree":G*NG-2}
+
+# ------------------------------------------
+# MÉTODO 5: PAIRS CLUSTER BOOTSTRAP-t (SE padrão OLS)
+# ------------------------------------------
+def _ols_beta_bse_default(df):
+    X = sm.add_constant(df["x"].to_numpy())
+    y = df["y"].to_numpy()
+    res = sm.OLS(y, X).fit()
+    beta = np.asarray(res.params, dtype=float)
+    se   = np.asarray(res.bse,    dtype=float)
+    return beta, se
+
+def _ols_beta1_and_default_w(df, beta0):
+    beta_hat, se_hat = _ols_beta_bse_default(df)
+    se1 = float(se_hat[1])
+    w = (float(beta_hat[1]) - beta0) / se1
+    return float(beta_hat[1]), se1, w
+
+def _pairs_cluster_bootstrap_t_default(df, B=399, alpha=0.05, base_ss=None):
+    cluster_dfs = [g[1] for g in df.groupby("cluster", sort=True)]
+    G_here = len(cluster_dfs)
+    beta1_hat = float(_ols_beta_bse_default(df)[0][1])
+    if base_ss is None:
+        base_ss = SeedSequence(12345)
+    child_ss = base_ss.spawn(B)
+    wstars = np.empty(B, dtype=float)
+    for b in range(B):
+        local_rng = default_rng(child_ss[b].generate_state(2, dtype=np.uint32))
+        sel = local_rng.integers(low=0, high=G_here, size=G_here)
+        parts = []
+        for j, idx in enumerate(sel):
+            tmp = cluster_dfs[idx].copy()
+            tmp["cluster"] = j + 1
+            parts.append(tmp)
+        boot_df = pd.concat(parts, ignore_index=True)
+        beta_b, se_b = _ols_beta_bse_default(boot_df)
+        se1_b = float(se_b[1])
+        wstars[b] = (float(beta_b[1]) - beta1_hat) / se1_b
+    q_low = float(np.quantile(wstars, alpha/2))
+    q_high = float(np.quantile(wstars, 1-alpha/2))
+    return q_low, q_high
+
+def run_mc_pairs_t_default(G, dgp_fn, NG=30, R=1000, B=399, alpha=0.05,
+                           seed_data=42, seed_boot=999, beta1_H0=1.0):
+    global rng; rng = default_rng(seed_data)
+    base_ss_mc = SeedSequence(seed_boot)
+    rejs = []; wabs = []
+    for r in range(R):
+        df = dgp_fn(G, NG, beta_0=beta_0, beta_1=beta_1)
+        beta1_hat, se_ols, w = _ols_beta1_and_default_w(df, beta0=beta1_H0)
+        wabs.append(abs(w))
+        q_low, q_high = _pairs_cluster_bootstrap_t_default(
+            df, B=B, alpha=alpha, base_ss=base_ss_mc.spawn(1)[0])
+        rejs.append(int((w < q_low) or (w > q_high)))
+    rate = np.mean(rejs); se = np.sqrt(rate*(1-rate)/R)
+    return {"rej":rate,"rej_se":se,"mean_abs_w":np.mean(wabs),
+            "crit":"boot", "dfree":G*NG-2}
+
+
+# ------------------------------------------
+# MÉTODO 6: PAIRS CLUSTER BOOTSTRAP-t (CRVE)
+# ------------------------------------------
+def _ols_beta1_and_crve_w(df, beta0):
+    X = sm.add_constant(df["x"].to_numpy())
+    y = df["y"].to_numpy()
+    clusters = df["cluster"].to_numpy()
+    G_here = len(np.unique(clusters))
+
+    res = sm.OLS(y, X).fit()
+    beta = res.params
+    u = res.resid
+    XTX_inv = np.linalg.inv(X.T @ X)
+
+    scale = (G_here/(G_here-1)) if G_here>1 else 1.0
+    S = np.zeros((X.shape[1], X.shape[1]))
+    for g in np.unique(clusters):
+        idx = (clusters==g)
+        Xg = X[idx,:]
+        ug = u[idx]*scale
+        S += Xg.T @ (ug[:,None] @ ug[None,:]) @ Xg
+    V = XTX_inv @ S @ XTX_inv
+    se_beta1 = float(np.sqrt(V[1,1]))
+    beta1_hat = float(beta[1])
+    w = (beta1_hat - beta0)/se_beta1
+    return beta1_hat, se_beta1, w
+
+def _pairs_cluster_bootstrap_t_crve(df, B=399, alpha=0.05, base_ss=None):
+    cluster_dfs = [g[1] for g in df.groupby("cluster", sort=True)]
+    G_here = len(cluster_dfs)
+    beta1_hat, _, _ = _ols_beta1_and_crve_w(df, beta0=0.0)
+    if base_ss is None:
+        base_ss = SeedSequence(12345)
+    child_ss = base_ss.spawn(B)
+    wstars = np.empty(B)
+    for b in range(B):
+        local_rng = default_rng(child_ss[b].generate_state(2, dtype=np.uint32))
+        sel = local_rng.integers(low=0, high=G_here, size=G_here)
+        parts=[]
+        for j,idx in enumerate(sel):
+            tmp = cluster_dfs[idx].copy()
+            tmp["cluster"]=j+1
+            parts.append(tmp)
+        boot_df = pd.concat(parts,ignore_index=True)
+        beta1_b,se1_b,_ = _ols_beta1_and_crve_w(boot_df,beta0=beta1_hat)
+        wstars[b] = (beta1_b-beta1_hat)/se1_b
+    q_low = float(np.quantile(wstars,alpha/2))
+    q_high= float(np.quantile(wstars,1-alpha/2))
+    return q_low,q_high
+
+def run_mc_pairs_t_crve(G,dgp_fn,NG=30,R=1000,B=399,alpha=0.05,
+                        seed_data=42,seed_boot=999,beta1_H0=1.0):
+    global rng; rng = default_rng(seed_data)
+    base_ss_mc = SeedSequence(seed_boot)
+    rejs=[]; wabs=[]
+    for r in range(R):
+        df=dgp_fn(G,NG,beta_0=beta_0,beta_1=beta_1)
+        beta1_hat,se_crve,w = _ols_beta1_and_crve_w(df,beta0=beta1_H0)
+        wabs.append(abs(w))
+        q_low,q_high=_pairs_cluster_bootstrap_t_crve(
+            df,B=B,alpha=alpha,base_ss=base_ss_mc.spawn(1)[0])
+        rejs.append(int((w<q_low) or (w>q_high)))
+    rate=np.mean(rejs); se=np.sqrt(rate*(1-rate)/R)
+    return {"rej":rate,"rej_se":se,"mean_abs_w":np.mean(wabs),
+            "crit":"boot","dfree":G*NG-2}
+
+# ------------------------------------------
+# MÉTODO 7: PAIRS CLUSTER BOOTSTRAP-t (CR3 jackknife por cluster)
+# ------------------------------------------
+def _ols_beta(df):
+    X = sm.add_constant(df["x"].to_numpy())
+    y = df["y"].to_numpy()
+    res = sm.OLS(y, X).fit()
+    return np.asarray(res.params, dtype=float)  # [const,x]
+
+def _cr3_vcov_jackknife(df):
+    clusters = np.array(sorted(df["cluster"].unique()))
+    G_here = len(clusters)
+    if G_here < 2:
+        raise ValueError("CR3 requer G >= 2 clusters.")
+    betas_lo = []
+    for g in clusters:
+        df_lo = df.loc[df["cluster"] != g]
+        betas_lo.append(_ols_beta(df_lo))
+    betas_lo = np.asarray(betas_lo)           # (G,2)
+    beta_bar = betas_lo.mean(axis=0)          # (2,)
+    diffs = betas_lo - beta_bar               # (G,2)
+    V = (G_here - 1) / G_here * (diffs.T @ diffs)
+    return V
+
+def _ols_beta1_and_cr3_w(df, beta0):
+    beta_hat = _ols_beta(df)
+    V_cr3 = _cr3_vcov_jackknife(df)
+    se_beta1 = float(np.sqrt(V_cr3[1,1]))
+    w = (float(beta_hat[1]) - beta0)/se_beta1
+    return float(beta_hat[1]), se_beta1, w
+
+def _pairs_cluster_bootstrap_t_cr3(df,B=399,alpha=0.05,base_ss=None):
+    cluster_dfs = [g[1] for g in df.groupby("cluster", sort=True)]
+    G_here = len(cluster_dfs)
+    beta1_hat = _ols_beta(df)[1]
+    if base_ss is None:
+        base_ss = SeedSequence(12345)
+    child_ss = base_ss.spawn(B)
+    wstars = np.empty(B)
+    for b in range(B):
+        local_rng = default_rng(child_ss[b].generate_state(2,dtype=np.uint32))
+        sel = local_rng.integers(low=0,high=G_here,size=G_here)
+        parts=[]
+        for j,idx in enumerate(sel):
+            tmp = cluster_dfs[idx].copy()
+            tmp["cluster"]=j+1
+            parts.append(tmp)
+        boot_df = pd.concat(parts,ignore_index=True)
+        beta1_b = _ols_beta(boot_df)[1]
+        V_b = _cr3_vcov_jackknife(boot_df)
+        se1_b = float(np.sqrt(V_b[1,1]))
+        wstars[b] = (beta1_b - beta1_hat)/se1_b
+    q_low = float(np.quantile(wstars,alpha/2))
+    q_high= float(np.quantile(wstars,1-alpha/2))
+    return q_low,q_high
+
+def run_mc_pairs_t_cr3(G,dgp_fn,NG=30,R=1000,B=399,alpha=0.05,
+                       seed_data=42,seed_boot=999,beta1_H0=1.0):
+    global rng; rng = default_rng(seed_data)
+    base_ss_mc = SeedSequence(seed_boot)
+    rejs=[]; wabs=[]
+    for r in range(R):
+        df = dgp_fn(G,NG,beta_0=beta_0,beta_1=beta_1)
+        beta1_hat,se_cr3,w = _ols_beta1_and_cr3_w(df,beta0=beta1_H0)
+        wabs.append(abs(w))
+        q_low,q_high = _pairs_cluster_bootstrap_t_cr3(
+            df,B=B,alpha=alpha,base_ss=base_ss_mc.spawn(1)[0])
+        rejs.append(int((w<q_low) or (w>q_high)))
+    rate=np.mean(rejs); se=np.sqrt(rate*(1-rate)/R)
+    return {"rej":rate,"rej_se":se,"mean_abs_w":np.mean(wabs),
+            "crit":"boot","dfree":G*NG-2}
+
+# ------------------------------------------
+# MÉTODO 8: CLUSTER RESIDUAL BOOTSTRAP-t (H0 imposto)
+# ------------------------------------------
+def _fit_ols_cluster(df):
+    X = sm.add_constant(df["x"].to_numpy())
+    y = df["y"].to_numpy()
+    ols = sm.OLS(y, X).fit()
+    groups = df["cluster"].to_numpy()
+    rob = ols.get_robustcov_results(
+        cov_type="cluster", groups=groups,
+        use_correction=True, df_correction=True
+    )
+    return float(rob.params[1]), float(rob.bse[1])
+
+def _restricted_fit_and_cluster_residuals(df, beta_true):
+    y = df["y"].to_numpy(); x = df["x"].to_numpy()
+    clusters = df["cluster"].to_numpy()
+    G_here = len(np.unique(clusters))
+    y_restr = y - beta_true * x
+    cR = float(sm.OLS(y_restr, np.ones((len(y_restr),1))).fit().params[0])
+    yhat0 = beta_true*x + cR
+    uR = y - yhat0
+    uR_scaled = (G_here/(G_here-1))*uR
+    res_by_cluster = []
+    X_by_cluster = []
+    for g in sorted(np.unique(clusters)):
+        idx = clusters==g
+        res_by_cluster.append(uR_scaled[idx].copy())
+        X_by_cluster.append(np.column_stack([np.ones(idx.sum()), x[idx]]))
+    betaR = np.array([cR, beta_true], dtype=float)
+    return betaR, res_by_cluster, X_by_cluster
+
+def _cluster_residual_bootstrap_t_H0(df, beta_true, B=399, alpha=0.05, base_ss=None):
+    b1_hat, se1 = _fit_ols_cluster(df)
+    w_obs = (b1_hat - beta_true)/se1
+    betaR, res_by_cluster, X_by_cluster = _restricted_fit_and_cluster_residuals(df,beta_true)
+    G_here = len(res_by_cluster)
+    if base_ss is None: base_ss = SeedSequence(12345)
+    child_ss = base_ss.spawn(B)
+    wstars = np.empty(B)
+    for b in range(B):
+        local_rng = default_rng(child_ss[b].generate_state(2,dtype=np.uint32))
+        donor_idx = local_rng.integers(low=0,high=G_here,size=G_here)
+        y_star_parts=[]; x_star_parts=[]; cl_parts=[]
+        for g in range(G_here):
+            u_g_star = res_by_cluster[donor_idx[g]]
+            X_g = X_by_cluster[g]
+            y_g_star = X_g @ betaR + u_g_star
+            y_star_parts.append(y_g_star)
+            x_star_parts.append(X_g[:,1])
+            cl_parts.append(np.full(X_g.shape[0],g+1))
+        y_star=np.concatenate(y_star_parts)
+        x_star=np.concatenate(x_star_parts)
+        cl_star=np.concatenate(cl_parts)
+        df_star=pd.DataFrame({"y":y_star,"x":x_star,"cluster":cl_star})
+        b1_star,se1_star=_fit_ols_cluster(df_star)
+        wstars[b]=(b1_star-beta_true)/se1_star
+    q_low=float(np.quantile(wstars,alpha/2))
+    q_high=float(np.quantile(wstars,1-alpha/2))
+    return w_obs,q_low,q_high
+
+def run_mc_residual_t_H0(G,dgp_fn,NG=30,R=1000,B=399,alpha=0.05,
+                         seed_data=42,seed_boot=999,beta1_H0=1.0):
+    global rng; rng = default_rng(seed_data)
+    base_ss_mc = SeedSequence(seed_boot)
+    rejs=[]
+    for r in range(R):
+        df = dgp_fn(G,NG,beta_0=beta_0,beta_1=beta_1)
+        w_obs,q_low,q_high = _cluster_residual_bootstrap_t_H0(
+            df,beta_true=beta1_H0,B=B,alpha=alpha,
+            base_ss=base_ss_mc.spawn(1)[0])
+        rejs.append(int((w_obs<q_low) or (w_obs>q_high)))
+    rate=np.mean(rejs); se=np.sqrt(rate*(1-rate)/R)
+    return {"rej":rate,"rej_se":se,"crit":"boot","dfree":G*NG-2}
+
+# ------------------------------------------
+# MÉTODO 9: WILD CLUSTER BOOTSTRAP-t (CGM/BDM)
+# ------------------------------------------
+def _fit_ols_cluster(df):
+    X = sm.add_constant(df["x"].to_numpy())
+    y = df["y"].to_numpy()
+    ols = sm.OLS(y, X).fit()
+    groups = df["cluster"].to_numpy()
+    rob = ols.get_robustcov_results(
+        cov_type="cluster", groups=groups,
+        use_correction=True, df_correction=True
+    )
+    return float(rob.params[1]), float(rob.bse[1])
+
+def _wild_cluster_bootstrap_t(df, beta_true, B=399, base_ss=None):
+    # estatística observada
+    b1_hat, se1 = _fit_ols_cluster(df)
+    t_obs = (b1_hat - beta_true) / se1
+
+    # ajuste restrito para resíduos sob H0
+    y = df["y"].to_numpy(); x = df["x"].to_numpy()
+    y_restr = y - beta_true*x
+    c_hat = float(sm.OLS(y_restr, np.ones((len(y_restr),1))).fit().params[0])
+    y_hat0 = beta_true*x + c_hat
+    e0 = y - y_hat0
+
+    clusters = df["cluster"].to_numpy()
+    uniq = np.unique(clusters)
+    if base_ss is None:
+        base_ss = SeedSequence(12345)
+    child_ss = base_ss.spawn(B)
+
+    t_boot = np.empty(B)
+    for b in range(B):
+        local_rng = default_rng(child_ss[b].generate_state(2,dtype=np.uint32))
+        w = {g: local_rng.choice([-1.0,1.0]) for g in uniq}
+        y_star = y_hat0 + np.array([w[g] for g in clusters])*e0
+        df_star = df.copy()
+        df_star["y"] = y_star
+        b1_star, se1_star = _fit_ols_cluster(df_star)
+        t_boot[b] = (b1_star - beta_true) / se1_star
+
+    # p-valor bicaudal
+    p_boot = np.mean(np.abs(t_boot) >= np.abs(t_obs))
+    return p_boot, t_obs
+
+def run_mc_wild_t(G,dgp_fn,NG=30,R=1000,B=399,alpha=0.05,
+                  seed_data=42,seed_boot=999,beta1_H0=1.0):
+    global rng; rng = default_rng(seed_data)
+    base_ss_mc = SeedSequence(seed_boot)
+    rejs=[]
+    for r in range(R):
+        df = dgp_fn(G,NG,beta_0=beta_0,beta_1=beta_1)
+        p_boot,t_obs = _wild_cluster_bootstrap_t(
+            df,beta_true=beta1_H0,B=B,base_ss=base_ss_mc.spawn(1)[0])
+        rejs.append(p_boot<alpha)
+    rate=np.mean(rejs); se=np.sqrt(rate*(1-rate)/R)
+    return {"rej":rate,"rej_se":se,"crit":"boot","dfree":G*NG-2}
+
+# ------------------------------------------
+# LISTA DE MÉTODOS DISPONÍVEIS
+# (adicione novos aqui facilmente depois)
+# ------------------------------------------
+bootstrap_methods = [
+    ("pairs", run_mc_pairs),
+    ("residual", run_mc_residual),
+    ("wild", run_mc_wild),
+    ("bca", run_mc_bca),
+    ("pairs_t_default", run_mc_pairs_t_default),
+    ("pairs_t_crve", run_mc_pairs_t_crve),
+    ("pairs_t_cr3", run_mc_pairs_t_cr3),
+    ("residual_t_H0", run_mc_residual_t_H0),
+    ("wild_t", run_mc_wild_t),   
+]
+
+
+
+
+# ------------------------------------------
+# EXECUÇÃO PARA TODOS DGP × G × MÉTODO
+# ------------------------------------------
+if __name__ == "__main__":
+    tasks=[]
+    base_ss=SeedSequence(2025)
+    for name,fn in dgps:
+        for G_target in [5,10,15]:
+            for mname,_ in bootstrap_methods:
+                ss=base_ss.spawn(1)[0]
+                sd=int(ss.generate_state(1,dtype=np.uint32)[0]+1_000_000)
+                sb=int(ss.generate_state(1,dtype=np.uint32)[0]+2_000_000)
+                tasks.append((name,fn,G_target,mname,sd,sb))
+
+    def _one(idx,name,fn,G,mname,sd,sb):
+        method_fn = dict(bootstrap_methods)[mname]
+        res = method_fn(G,fn,NG=NG,R=R,B=B,alpha=alpha,
+                        seed_data=sd,seed_boot=sb)
+        return (idx,name,G,mname,res)
+
+    results = Parallel(n_jobs=N_WORKERS,prefer="processes")(
+        delayed(_one)(i,n,f,G,m,sd,sb)
+        for i,(n,f,G,m,sd,sb) in enumerate(tasks)
+    )
+
+    # montar CSV
+    rows=[]
+    for _,name,G,m,res in sorted(results,key=lambda x:x[0]):
+        print(f"\n== DGP: {name} | G={G} | Método: {m} ==")
+        print(f"Taxa de rejeição: {res['rej']:.4f} (SE: {res['rej_se']:.4f})")
+        rows.append({
+            "dgp":name, "G":G, "bootstrap":m,
+            "rej":res['rej'], "rej_se":res['rej_se'],
+            "crit":res['crit'], "dfree":res['dfree'],
+            "R":R,"B":B,"NG":NG,"alpha":alpha
+        })
+
+    df_out=pd.DataFrame(rows)
+    df_out.to_csv("results_mc_all_bootstraps.csv",index=False)
+    stamp=datetime.now().strftime("%Y%m%d_%H%M%S")
+    df_out.to_csv(f"results_mc_all_bootstraps_{stamp}.csv",index=False)
+
+    print("\nResultados salvos em CSV.")
+    
+from pathlib import Path
+from datetime import datetime
+
+downloads = Path(r"C:\Users\joaol\Downloads")
+downloads.mkdir(exist_ok=True)
+
+stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+base_name = f"results_mc_all_bootstraps_{stamp}.csv"
+out_path = downloads / base_name
+
+# salva o resultado com timestamp e também a versão "mais recente"
+df_out.to_csv(out_path, index=False)
+df_out.to_csv(downloads / "results_mc_all_bootstraps.csv", index=False)
+
+print(f"\n✅ Resultados salvos em: {out_path}")
