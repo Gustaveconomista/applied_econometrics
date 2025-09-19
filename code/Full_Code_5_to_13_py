@@ -716,7 +716,7 @@ if __name__ == "__main__":
     tasks=[]
     base_ss=SeedSequence(2025)
     for name,fn in dgps:
-        for G_target in [5,10,15]:
+        for G_target in [5]:
             for mname,_ in bootstrap_methods:
                 ss=base_ss.spawn(1)[0]
                 sd=int(ss.generate_state(1,dtype=np.uint32)[0]+1_000_000)
@@ -753,18 +753,4 @@ if __name__ == "__main__":
 
     print("\nResultados salvos em CSV.")
     
-from pathlib import Path
-from datetime import datetime
 
-downloads = Path(r"C:\Users\joaol\Downloads")
-downloads.mkdir(exist_ok=True)
-
-stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-base_name = f"results_mc_all_bootstraps_{stamp}.csv"
-out_path = downloads / base_name
-
-# salva o resultado com timestamp e também a versão "mais recente"
-df_out.to_csv(out_path, index=False)
-df_out.to_csv(downloads / "results_mc_all_bootstraps.csv", index=False)
-
-print(f"\n✅ Resultados salvos em: {out_path}")
