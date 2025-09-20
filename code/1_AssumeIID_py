@@ -1,0 +1,147 @@
+# ================================================
+# Monte Carlo OLS simples
+# Taxa de rejeição + SE da taxa
+# para 6 DGPs × G ∈ {5,10,15}
+# ================================================
+
+import numpy as np
+import statsmodels.api as sm
+from scipy.stats import t
+
+# -----------------------------
+# PARÂMETROS
+# -----------------------------
+NG     = 30
+R      = 1000
+alpha  = 0.05
+beta1_H0 = 1.0
+
+rng = np.random.default_rng(42)
+
+# -----------------------------
+# DGPs HOMO
+# -----------------------------
+def generate_data_normal(G, NG, beta_0=0, beta_1=1):
+    zg, eps_g = rng.normal(size=G), rng.normal(size=G)
+    frames = []
+    for g in range(G):
+        zig, eps_i = rng.normal(size=NG), rng.normal(size=NG)
+        xig = zg[g] + zig
+        uig = eps_g[g] + eps_i
+        y   = beta_0 + beta_1*xig + uig
+        frames.append({"x":xig, "y":y})
+    return { "x": np.concatenate([f["x"] for f in frames]),
+             "y": np.concatenate([f["y"] for f in frames]) }
+
+def generate_data_exp_centered(G, NG, beta_0=0, beta_1=1):
+    zg, eps_g = rng.exponential(size=G)-1.0, rng.exponential(size=G)-1.0
+    frames = []
+    for g in range(G):
+        zig, eps_i = rng.exponential(size=NG)-1.0, rng.exponential(size=NG)-1.0
+        xig = zg[g] + zig
+        uig = eps_g[g] + eps_i
+        y   = beta_0 + beta_1*xig + uig
+        frames.append({"x":xig, "y":y})
+    return { "x": np.concatenate([f["x"] for f in frames]),
+             "y": np.concatenate([f["y"] for f in frames]) }
+
+def generate_data_uniform(G, NG, beta_0=0, beta_1=1):
+    a, b = -np.sqrt(3), np.sqrt(3)
+    zg, eps_g = rng.uniform(a,b,G), rng.uniform(a,b,G)
+    frames = []
+    for g in range(G):
+        zig, eps_i = rng.uniform(a,b,NG), rng.uniform(a,b,NG)
+        xig = zg[g] + zig
+        uig = eps_g[g] + eps_i
+        y   = beta_0 + beta_1*xig + uig
+        frames.append({"x":xig, "y":y})
+    return { "x": np.concatenate([f["x"] for f in frames]),
+             "y": np.concatenate([f["y"] for f in frames]) }
+
+# -----------------------------
+# DGPs HETERO
+# -----------------------------
+def generate_data_hetero_normal(G, NG, beta_0=0, beta_1=1):
+    zg, eps_g = rng.normal(size=G), rng.normal(size=G)
+    frames = []
+    for g in range(G):
+        zig = rng.normal(size=NG)
+        xig = zg[g] + zig
+        sd  = 3*np.abs(xig)
+        eps_i = rng.normal(size=NG)*sd
+        uig = eps_g[g] + eps_i
+        y   = beta_0 + beta_1*xig + uig
+        frames.append({"x":xig, "y":y})
+    return { "x": np.concatenate([f["x"] for f in frames]),
+             "y": np.concatenate([f["y"] for f in frames]) }
+
+def generate_data_hetero_exp_centered(G, NG, beta_0=0, beta_1=1):
+    zg, eps_g = rng.exponential(size=G)-1.0, rng.exponential(size=G)-1.0
+    frames = []
+    for g in range(G):
+        zig  = rng.exponential(size=NG)-1.0
+        xig  = zg[g] + zig
+        sd   = 3*np.abs(xig)
+        base = rng.exponential(size=NG)-1.0
+        eps_i = sd*base
+        uig = eps_g[g] + eps_i
+        y   = beta_0 + beta_1*xig + uig
+        frames.append({"x":xig, "y":y})
+    return { "x": np.concatenate([f["x"] for f in frames]),
+             "y": np.concatenate([f["y"] for f in frames]) }
+
+def generate_data_hetero_uniform(G, NG, beta_0=0, beta_1=1):
+    a, b = -np.sqrt(3), np.sqrt(3)
+    zg, eps_g = rng.uniform(a,b,G), rng.uniform(a,b,G)
+    frames = []
+    for g in range(G):
+        zig  = rng.uniform(a,b,NG)
+        xig  = zg[g] + zig
+        sd   = 3*np.abs(xig)
+        base = rng.uniform(a,b,NG)
+        eps_i = sd*base
+        uig = eps_g[g] + eps_i
+        y   = beta_0 + beta_1*xig + uig
+        frames.append({"x":xig, "y":y})
+    return { "x": np.concatenate([f["x"] for f in frames]),
+             "y": np.concatenate([f["y"] for f in frames]) }
+
+# -----------------------------
+# LISTA DE DGPs
+# -----------------------------
+dgps = [
+    ("HOMO  Normal(0,1)",            generate_data_normal),
+    ("HOMO  Exp(1)-1",               generate_data_exp_centered),
+    ("HOMO  Uniforme(-√3,√3)",       generate_data_uniform),
+    ("HETERO Normal var=9x^2",       generate_data_hetero_normal),
+    ("HETERO Exp-centr var=9x^2",    generate_data_hetero_exp_centered),
+    ("HETERO Unif var=9x^2",         generate_data_hetero_uniform),
+]
+
+# -----------------------------
+# FUNÇÃO MONTE CARLO
+# -----------------------------
+def rejection_rate_mc(dgp_fn, G, NG=30, R=1000, alpha=0.05, beta1_H0=1.0):
+    rejections = []
+    for r in range(R):
+        data = dgp_fn(G, NG)
+        X = sm.add_constant(data["x"])
+        y = data["y"]
+        model = sm.OLS(y, X).fit()
+        beta1_hat = model.params[1]
+        se1   = model.bse[1]
+        dfree = len(y) - 2
+        tval  = (beta1_hat - beta1_H0) / se1
+        tcrit = t.ppf(1 - alpha/2, df=dfree)
+        rejections.append(int(abs(tval) > tcrit))
+    rate = np.mean(rejections)
+    se   = np.sqrt(rate*(1-rate)/R)
+    return rate, se
+
+# -----------------------------
+# RODAR TODOS OS CASOS
+# -----------------------------
+for name, dgp_fn in dgps:
+    for G in [5, 10, 15]:
+        rate, se = rejection_rate_mc(dgp_fn, G, R=R, alpha=alpha)
+        print(f"DGP: {name} | G={G} | Rejection rate: {rate:.4f} | SE: {se:.4f}")
