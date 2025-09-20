@@ -716,7 +716,7 @@ if __name__ == "__main__":
     tasks=[]
     base_ss=SeedSequence(2025)
     for name,fn in dgps:
-        for G_target in [10]:
+        for G_target in [15]:
             for mname,_ in bootstrap_methods:
                 ss=base_ss.spawn(1)[0]
                 sd=int(ss.generate_state(1,dtype=np.uint32)[0]+1_000_000)
